@@ -1,0 +1,27 @@
+[package]
+name = "aishell"
+version = "0.1.0"
+edition = "2024"
+description = "Generate shell commands from natural-language prompts"
+license = "MIT"
+
+[[bin]]
+name = "ai"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
