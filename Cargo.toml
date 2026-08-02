@@ -2,6 +2,7 @@
 name = "aishell"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Generate shell commands from natural-language prompts"
 license = "MIT"
 
@@ -11,12 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 rpassword = "7.4"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-toml = "0.8"
+toml = "1.1.4"
 
 [dev-dependencies]
 tempfile = "3.20"

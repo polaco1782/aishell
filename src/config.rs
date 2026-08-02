@@ -1,16 +1,17 @@
 use std::env;
-use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::secure_fs::{atomic_write_private, verify_private_file};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL: &str = "openrouter/auto";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 256;
+const DEFAULT_CONTEXT_MAX_TURNS: usize = 6;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +19,8 @@ pub struct Config {
     pub openrouter: OpenRouterConfig,
     #[serde(default)]
     pub generation: GenerationConfig,
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -39,11 +42,29 @@ pub struct GenerationConfig {
     pub max_output_tokens: u32,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextConfig {
+    #[serde(default = "default_context_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_context_max_turns")]
+    pub max_turns: usize,
+}
+
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_turns: DEFAULT_CONTEXT_MAX_TURNS,
         }
     }
 }
@@ -68,8 +89,8 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        verify_secure_file(path)?;
-        let contents = fs::read_to_string(path).with_context(|| {
+        verify_private_file(path, "configuration")?;
+        let contents = std::fs::read_to_string(path).with_context(|| {
             format!(
                 "could not read {}; run `ai setup` to create it",
                 path.display()
@@ -117,62 +138,29 @@ impl Config {
         if !(16..=2048).contains(&self.generation.max_output_tokens) {
             bail!("generation.max_output_tokens must be between 16 and 2048");
         }
+        if !(1..=20).contains(&self.context.max_turns) {
+            bail!("context.max_turns must be between 1 and 20");
+        }
 
         Ok(())
     }
 
     pub fn redacted_toml(&self) -> String {
         format!(
-            "[openrouter]\napi_key = \"<redacted>\"\nmodel = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n",
+            "[openrouter]\napi_key = \"<redacted>\"\nmodel = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n",
             self.openrouter.model,
             self.openrouter.base_url,
             self.generation.timeout_seconds,
-            self.generation.max_output_tokens
+            self.generation.max_output_tokens,
+            self.context.enabled,
+            self.context.max_turns
         )
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let parent = path
-            .parent()
-            .context("the configuration path has no parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-        set_directory_permissions(parent)?;
-
-        if path.exists() {
-            verify_secure_file(path)?;
-        }
-
         let contents = toml::to_string_pretty(self).context("could not serialize configuration")?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary_path =
-            parent.join(format!(".config.toml.{}.{}.tmp", std::process::id(), nonce));
-
-        let write_result = (|| -> Result<()> {
-            let mut temporary = open_private_file(&temporary_path)?;
-            temporary
-                .write_all(contents.as_bytes())
-                .context("could not write temporary configuration")?;
-            temporary
-                .sync_all()
-                .context("could not flush temporary configuration")?;
-            fs::rename(&temporary_path, path).with_context(|| {
-                format!("could not replace configuration at {}", path.display())
-            })?;
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| format!("could not flush {}", parent.display()))?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temporary_path);
-        }
-        write_result
+        atomic_write_private(path, contents.as_bytes(), "configuration")
     }
 }
 
@@ -217,6 +205,14 @@ pub fn interactive_setup() -> Result<PathBuf> {
         value => value.to_owned(),
     };
 
+    let generation = existing
+        .as_ref()
+        .map(|config| config.generation.clone())
+        .unwrap_or_default();
+    let context = existing
+        .as_ref()
+        .map(|config| config.context.clone())
+        .unwrap_or_default();
     let config = Config {
         openrouter: OpenRouterConfig {
             api_key,
@@ -226,7 +222,8 @@ pub fn interactive_setup() -> Result<PathBuf> {
                 |config| config.openrouter.base_url.clone(),
             ),
         },
-        generation: existing.map(|config| config.generation).unwrap_or_default(),
+        generation,
+        context,
     };
     config.save_to(&path)?;
     Ok(path)
@@ -248,84 +245,12 @@ const fn default_max_output_tokens() -> u32 {
     DEFAULT_MAX_OUTPUT_TOKENS
 }
 
-#[cfg(unix)]
-fn verify_secure_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let symlink_metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "could not inspect {}; run `ai setup` to create it",
-            path.display()
-        )
-    })?;
-    if symlink_metadata.file_type().is_symlink() {
-        bail!(
-            "refusing to read the configuration through the symlink {}",
-            path.display()
-        );
-    }
-    if !symlink_metadata.is_file() {
-        bail!(
-            "configuration path {} is not a regular file",
-            path.display()
-        );
-    }
-
-    let mode = symlink_metadata.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        bail!(
-            "configuration {} has insecure permissions {:03o}; run `chmod 600 {}`",
-            path.display(),
-            mode,
-            path.display()
-        );
-    }
-    Ok(())
+const fn default_context_enabled() -> bool {
+    true
 }
 
-#[cfg(not(unix))]
-fn verify_secure_file(path: &Path) -> Result<()> {
-    if !path.is_file() {
-        bail!(
-            "configuration path {} is not a regular file",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("could not secure {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_private_file(path: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn open_private_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))
+const fn default_context_max_turns() -> usize {
+    DEFAULT_CONTEXT_MAX_TURNS
 }
 
 #[cfg(test)]
@@ -334,7 +259,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Config, GenerationConfig, OpenRouterConfig};
+    use super::{Config, ContextConfig, GenerationConfig, OpenRouterConfig};
 
     fn config() -> Config {
         Config {
@@ -344,6 +269,7 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".into(),
             },
             generation: GenerationConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 
@@ -373,6 +299,21 @@ mod tests {
         let shown = config().redacted_toml();
         assert!(!shown.contains("secret-value"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn older_configuration_gets_default_context_settings() {
+        let parsed: Config = toml::from_str(
+            r#"[openrouter]
+api_key = "secret-value"
+model = "openrouter/auto"
+base_url = "https://openrouter.ai/api/v1"
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.context.enabled);
+        assert_eq!(parsed.context.max_turns, 6);
     }
 
     #[cfg(unix)]

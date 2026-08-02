@@ -35,6 +35,9 @@ pub enum Action {
     ConfigPath,
     ConfigShow,
     ConfigCheck,
+    ContextPath,
+    ContextShow,
+    ContextClear,
     Init(Shell),
     Help,
     Version,
@@ -68,6 +71,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Action> {
         [command, action] if command == "config" && action == "check" => {
             return Ok(Action::ConfigCheck);
         }
+        [command, action] if command == "context" && action == "path" => {
+            return Ok(Action::ContextPath);
+        }
+        [command, action] if command == "context" && action == "show" => {
+            return Ok(Action::ContextShow);
+        }
+        [command, action] if command == "context" && action == "clear" => {
+            return Ok(Action::ContextClear);
+        }
         _ => {}
     }
 
@@ -99,19 +111,22 @@ Usage:
   ai [description...]
   ai setup
   ai config path|show|check
+  ai context path|show|clear
   ai init bash|zsh
 
 Shell integration:
   source <(ai init bash)
   source <(ai init zsh)
 
-After installing the integration, type a natural-language description and press
-Tab. Shell commands and path completions take priority; otherwise the generated
-command replaces the current line but is not executed.
+After installing the integration, press Tab on an empty command line to open an
+`AI Command>` prompt. Enter a natural-language description there; the generated
+command replaces the editable command line but is not executed. Tab always uses
+normal shell completion when the command line already contains text. General
+questions receive a printed answer instead of a command.
 
-Use `ai <description>` to force generation when the description begins with the
-name of a real command. Type `ai` by itself and press Enter or Tab to be asked
-for the description first. The result is left in the command line for review.
+The integration keeps a bounded command-generation context in one private state
+database. Use `ai context show` to inspect the current context or `clear` to
+forget it.
 "#;
 
 #[cfg(test)]
@@ -170,6 +185,22 @@ mod tests {
                 shell: Some(Shell::Bash),
                 prompt: None,
             }
+        );
+    }
+
+    #[test]
+    fn parses_context_management_commands() {
+        assert_eq!(
+            parse(args(&["context", "path"])).unwrap(),
+            Action::ContextPath
+        );
+        assert_eq!(
+            parse(args(&["context", "show"])).unwrap(),
+            Action::ContextShow
+        );
+        assert_eq!(
+            parse(args(&["context", "clear"])).unwrap(),
+            Action::ContextClear
         );
     }
 }

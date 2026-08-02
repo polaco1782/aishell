@@ -8,15 +8,18 @@ use thiserror::Error;
 
 use crate::cli::Shell;
 use crate::config::Config;
+use crate::context::ContextTurn;
 
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_CLARIFICATION_BYTES: usize = 1024;
+const MAX_ANSWER_BYTES: usize = 4096;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum GeneratedOutput {
     Command(String),
     Clarification(String),
+    Answer(String),
 }
 
 pub struct OpenRouterClient {
@@ -54,19 +57,12 @@ impl OpenRouterClient {
         &self,
         request: &str,
         shell: Shell,
+        history: &[ContextTurn],
+        working_directory: &str,
     ) -> Result<GeneratedOutput, OpenRouterError> {
         let body = ChatRequest {
             model: &self.model,
-            messages: [
-                Message {
-                    role: "system",
-                    content: system_prompt(shell),
-                },
-                Message {
-                    role: "user",
-                    content: user_prompt(request),
-                },
-            ],
+            messages: chat_messages(shell, history, working_directory, request),
             max_tokens: self.max_output_tokens,
             stream: false,
             // Shell translation is a small, latency-sensitive task. Reasoning models can
@@ -100,7 +96,7 @@ impl OpenRouterClient {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: [Message; 2],
+    messages: Vec<Message>,
     max_tokens: u32,
     stream: bool,
     reasoning: ReasoningConfig,
@@ -163,27 +159,70 @@ pub enum OpenRouterError {
 
 fn system_prompt(shell: Shell) -> String {
     format!(
-        "Translate the user's request into a shell command only when it identifies a concrete \
-shell operation. The user may write in any language. Output exactly one line using one of \
-these forms: COMMAND: <one executable {} command line> or QUESTION: <one concise clarifying \
-question>. Use QUESTION when the request is vague, ambiguous, incomplete, unrelated to a \
-shell operation, or cannot safely become a concrete command. For example, 'um tabaco' \
-requires a QUESTION asking what the user wants to do with tobacco. Never use echo, printf, \
-or another command to print a clarification, refusal, or explanation. Do not use Markdown, \
-a prompt marker, commentary, or explanation outside the prefixed line. Do not add sudo \
-unless the user explicitly requests it. Quote concrete paths and values safely for {}. Do \
-not invent placeholders when the user supplied concrete values. A command will be shown for \
-review and must not be described as already executed.",
+        "You are an AI assistant embedded in an interactive shell. The user may request a shell \
+operation or ask a general question, in any language. Output exactly one line using one of these \
+forms: COMMAND: <one executable {} command line>, QUESTION: <one concise clarifying question>, \
+or ANSWER: <one concise plain-text answer>. Use COMMAND whenever the user identifies a concrete \
+shell operation, even if they do not know or name the appropriate utility. Use QUESTION only when \
+the user appears to want a shell operation but essential details or the intended outcome are \
+missing. Use ANSWER for general questions, explanations, capability questions, refusals, and any \
+request that should not become an executable command. For 'what can you do?', explain briefly that \
+you can answer questions and generate shell commands. Never use echo, printf, or another command \
+to print a question, answer, refusal, or explanation. Do not use Markdown, a prompt marker, \
+commentary, or explanation outside the prefixed line. Do not add sudo unless the user explicitly \
+requests it. Quote concrete paths and values safely for {}. Do not invent placeholders when the \
+user supplied concrete values. Previous request/response pairs may be included to resolve \
+references and preserve concrete paths, names, and values. Their commands were only inserted into \
+an editable shell buffer: they may have been changed or never executed, so never claim their \
+effects occurred. A new command will also be shown for review and must not be described as already \
+executed.",
         shell.as_str(),
         shell.as_str()
     )
 }
 
-fn user_prompt(request: &str) -> String {
+fn chat_messages(
+    shell: Shell,
+    history: &[ContextTurn],
+    working_directory: &str,
+    request: &str,
+) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(2 + history.len() * 2);
+    messages.push(Message {
+        role: "system",
+        content: system_prompt(shell),
+    });
+    for turn in history {
+        messages.push(Message {
+            role: "user",
+            content: historical_user_prompt(turn),
+        });
+        messages.push(Message {
+            role: "assistant",
+            content: turn.response.model_line(),
+        });
+    }
+    messages.push(Message {
+        role: "user",
+        content: user_prompt(working_directory, request),
+    });
+    messages
+}
+
+fn historical_user_prompt(turn: &ContextTurn) -> String {
     format!(
-        "Operating system: {}\nArchitecture: {}\nRequest:\n{}",
+        "Working directory at the time: {}\nPrior request:\n{}",
+        turn.working_directory, turn.request
+    )
+}
+
+fn user_prompt(working_directory: &str, request: &str) -> String {
+    format!(
+        "Operating system: {}\nArchitecture: {}\nCurrent working directory: \
+{}\nCurrent request:\n{}",
         std::env::consts::OS,
         std::env::consts::ARCH,
+        working_directory,
         request
     )
 }
@@ -241,9 +280,12 @@ fn parse_generated_output(content: &str) -> Result<GeneratedOutput, OpenRouterEr
     if let Some(question) = output.strip_prefix("QUESTION:") {
         return validate_clarification(question).map(GeneratedOutput::Clarification);
     }
+    if let Some(answer) = output.strip_prefix("ANSWER:") {
+        return validate_answer(answer).map(GeneratedOutput::Answer);
+    }
 
     Err(OpenRouterError::InvalidResponse(
-        "the response was not marked as COMMAND or QUESTION".into(),
+        "the response was not marked as COMMAND, QUESTION, or ANSWER".into(),
     ))
 }
 
@@ -260,11 +302,21 @@ fn validate_command(content: &str) -> Result<String, OpenRouterError> {
 }
 
 fn validate_clarification(content: &str) -> Result<String, OpenRouterError> {
-    validate_single_line(content, MAX_CLARIFICATION_BYTES)
+    validate_informational_output(content, MAX_CLARIFICATION_BYTES, "clarification")
+}
+
+fn validate_answer(content: &str) -> Result<String, OpenRouterError> {
+    validate_informational_output(content, MAX_ANSWER_BYTES, "answer")
+}
+
+fn validate_informational_output(
+    content: &str,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<String, OpenRouterError> {
+    validate_single_line(content, max_bytes)
         .map(str::to_owned)
-        .map_err(|error| {
-            OpenRouterError::InvalidResponse(format!("invalid clarification: {error}"))
-        })
+        .map_err(|error| OpenRouterError::InvalidResponse(format!("invalid {kind}: {error}")))
 }
 
 fn validate_single_line(content: &str, max_bytes: usize) -> Result<&str, String> {
@@ -290,10 +342,43 @@ fn sanitize_error(message: &str) -> String {
 mod tests {
     use reqwest::StatusCode;
 
+    use crate::cli::Shell;
+    use crate::context::{ContextResponse, ContextTurn};
+
     use super::{
-        GeneratedOutput, OpenRouterError, check_status, parse_chat_response, sanitize_error,
-        validate_command,
+        GeneratedOutput, OpenRouterError, chat_messages, check_status, parse_chat_response,
+        sanitize_error, validate_command,
     };
+
+    #[test]
+    fn sends_bounded_history_before_the_current_request() {
+        let history = [ContextTurn {
+            created_at: 1,
+            working_directory: "/tmp/images".into(),
+            request: "create a 50 meg file named disk.img".into(),
+            response: ContextResponse::Command("truncate -s 50M disk.img".into()),
+        }];
+        let messages = chat_messages(
+            Shell::Bash,
+            &history,
+            "/tmp/images",
+            "create a filesystem on it",
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("create a 50 meg file"));
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content, "COMMAND: truncate -s 50M disk.img");
+        assert!(messages[3].content.contains("create a filesystem on it"));
+        assert!(
+            messages[0]
+                .content
+                .contains("may have been changed or never executed")
+        );
+        assert!(messages[0].content.contains("ANSWER:"));
+        assert!(messages[0].content.contains("what can you do?"));
+    }
 
     #[test]
     fn extracts_a_single_command() {
@@ -320,6 +405,22 @@ mod tests {
         assert_eq!(
             parse_chat_response(response).unwrap(),
             GeneratedOutput::Clarification("What would you like to do with tobacco?".into())
+        );
+    }
+
+    #[test]
+    fn extracts_a_conversational_answer() {
+        let response = r#"{
+            "choices": [{
+                "message": {"content": "ANSWER: I can answer questions and generate shell commands for you to review."},
+                "finish_reason": "stop"
+            }]
+        }"#;
+        assert_eq!(
+            parse_chat_response(response).unwrap(),
+            GeneratedOutput::Answer(
+                "I can answer questions and generate shell commands for you to review.".into()
+            )
         );
     }
 
