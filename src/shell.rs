@@ -1,10 +1,17 @@
 use crate::cli::Shell;
+use crate::ui;
 
-pub fn init_script(shell: Shell) -> &'static str {
-    match shell {
+pub fn init_script(shell: Shell) -> String {
+    let template = match shell {
         Shell::Bash => BASH_INIT,
         Shell::Zsh => ZSH_INIT,
-    }
+    };
+
+    // Keep terminal-facing labels consistent with the standalone CLI.
+    template
+        .replace("{{AI_PROMPT}}", ui::AI_PROMPT)
+        .replace("{{THINKING}}", ui::THINKING)
+        .replace("{{ERROR}}", ui::ERROR)
 }
 
 // Bash cannot invoke its normal completion or accept-line widgets from a
@@ -18,7 +25,7 @@ if [[ ${AISHELL_SESSION_OWNER_PID-} != "$$" ]]; then
     export AISHELL_SESSION_OWNER_PID AISHELL_SESSION_ID
 fi
 
-__aishell_prompt_prefix='# AI Command> '
+__aishell_prompt_prefix='# {{AI_PROMPT}}'
 
 __aishell_bind_tab_fallback() {
     local binding=$1
@@ -53,13 +60,13 @@ __aishell_generate() {
     fi
 
     if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.bash.XXXXXXXX"); then
-        printf '\r\033[2K[ai] could not create a temporary diagnostics file\n' >&2
+        printf '\r\033[2K{{ERROR}} Could not create a temporary diagnostics file\n' >&2
         return
     fi
 
     # Do not let child diagnostics invalidate Readline's idea of the current
     # prompt geometry. A successful command redraws over this status in place.
-    printf '\r\033[2K[ai] generating command...' >&2
+    printf '\r\033[2K{{THINKING}}' >&2
     generated=$(command ai --shell bash -- "$request" 2>"$error_file")
     generation_status=$?
     error_text=$(<"$error_file")
@@ -78,7 +85,7 @@ __aishell_generate() {
         if [[ -n $error_text ]]; then
             printf '%s\n' "$error_text" >&2
         fi
-        printf '[ai] generation failed; request kept\n' >&2
+        printf '{{ERROR}} Generation failed; request kept for editing\n' >&2
     fi
 
     if (( generation_status == 0 )) && [[ -n $error_text ]]; then
@@ -138,16 +145,23 @@ if [[ ${AISHELL_SESSION_OWNER_PID-} != $$ ]]; then
     typeset -gx AISHELL_SESSION_ID="zsh-$$-$RANDOM-$RANDOM"
 fi
 
+__aishell_submit_prompt() {
+    typeset -g __aishell_prompt_submitted=1
+    # Leave the recursive editor without accepting a shell command or adding a
+    # new terminal line. The outer widget owns the request and final buffer.
+    zle .send-break
+}
+
 __aishell_tab() {
     emulate -L zsh
     local generated request error_file error_text status_message
     local original_prompt=$PROMPT
     local original_rprompt=$RPROMPT
-    local -i edit_status generation_status
+    local -i generation_status
 
     # During the recursive prompt, Tab must not recursively open another one.
     if (( __aishell_prompt_active )); then
-        zle accept-line
+        __aishell_submit_prompt
         return
     fi
 
@@ -159,28 +173,45 @@ __aishell_tab() {
 
     # A recursive edit gives the request its own prompt without executing the
     # natural-language buffer when Enter is pressed.
-    PROMPT='AI Command> '
+    PROMPT='{{AI_PROMPT}}'
     RPROMPT=
     typeset -g __aishell_prompt_active=1
+    typeset -g __aishell_prompt_submitted=0
+    # Enter should submit the recursive AI editor without accepting its text as
+    # a shell command. Preserve any existing themed accept-line widget.
+    zle -A accept-line __aishell_saved_accept_line
+    zle -N accept-line __aishell_submit_prompt
     zle reset-prompt
     zle recursive-edit
-    edit_status=$?
+    zle -A __aishell_saved_accept_line accept-line
+    zle -D __aishell_saved_accept_line
     typeset -g __aishell_prompt_active=0
     request=$BUFFER
     BUFFER=
     CURSOR=0
-    PROMPT=$original_prompt
-    RPROMPT=$original_rprompt
 
-    if (( edit_status != 0 )) || [[ -z ${request//[[:space:]]/} ]]; then
+    if (( ! __aishell_prompt_submitted )) || [[ -z ${request//[[:space:]]/} ]]; then
+        PROMPT=$original_prompt
+        RPROMPT=$original_rprompt
         zle reset-prompt
         return
     fi
 
-    zle -R '[ai] generating command...'
+    # Put the status in ZLE's real buffer so its cursor sits after the text;
+    # POSTDISPLAY would leave the cursor blinking underneath the emoji.
+    PROMPT=
+    RPROMPT=
+    BUFFER='{{THINKING}}'
+    CURSOR=${#BUFFER}
+    zle reset-prompt
+    zle -R
     if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.zsh.XXXXXXXX"); then
+        BUFFER=
+        CURSOR=0
+        PROMPT=$original_prompt
+        RPROMPT=$original_rprompt
         zle reset-prompt
-        zle -M '[ai] could not create a temporary diagnostics file'
+        zle -M '{{ERROR}} Could not create a temporary diagnostics file'
         return
     fi
     generated=$(command ai --shell zsh -- "$request" 2>"$error_file")
@@ -188,6 +219,8 @@ __aishell_tab() {
     error_text=$(<"$error_file")
     command rm -f -- "$error_file"
 
+    BUFFER=
+    CURSOR=0
     if (( generation_status == 0 )); then
         if [[ -n $generated ]]; then
             BUFFER=$generated
@@ -195,8 +228,10 @@ __aishell_tab() {
         fi
         status_message=$error_text
     else
-        status_message=${error_text:+$error_text$'\n'}'[ai] generation failed'
+        status_message=${error_text:+$error_text$'\n'}'{{ERROR}} Generation failed'
     fi
+    PROMPT=$original_prompt
+    RPROMPT=$original_rprompt
     zle reset-prompt
     if [[ -n $status_message ]]; then
         zle -M "$status_message"
@@ -204,7 +239,9 @@ __aishell_tab() {
 }
 
 typeset -gi __aishell_prompt_active=0
+typeset -gi __aishell_prompt_submitted=0
 zle -N __aishell_tab
+zle -N __aishell_submit_prompt
 for __aishell_keymap in emacs viins; do
     bindkey -M $__aishell_keymap '^I' __aishell_tab
 done
@@ -218,14 +255,15 @@ mod tests {
     #[test]
     fn bash_uses_ai_only_for_an_empty_buffer() {
         let script = init_script(Shell::Bash);
-        assert!(script.contains("__aishell_prompt_prefix='# AI Command> '"));
+        assert!(script.contains("__aishell_prompt_prefix='# 🤖 AI Command › '"));
         assert!(script.contains("if [[ -n $line ]]"));
         assert!(script.contains("__aishell_bind_tab_fallback complete"));
         assert!(script.contains("generated=$(command ai --shell bash -- \"$request\""));
         assert!(script.contains("READLINE_LINE=$generated"));
         assert!(script.contains("READLINE_POINT=${#READLINE_LINE}"));
         assert!(script.contains("__aishell_accept_or_generate"));
-        assert!(script.contains("[ai] generating command..."));
+        assert!(script.contains("✨ Crafting command…"));
+        assert!(!script.contains("{{"));
         assert!(script.contains("AISHELL_SESSION_ID=\"bash-$$-$RANDOM-$RANDOM\""));
         assert!(!script.contains("compgen"));
         assert!(!script.contains("command stty"));
@@ -236,16 +274,21 @@ mod tests {
         let script = init_script(Shell::Zsh);
         assert!(script.contains("if [[ -n $BUFFER ]]"));
         assert!(script.contains("zle expand-or-complete"));
-        assert!(script.contains("PROMPT='AI Command> '"));
+        assert!(script.contains("PROMPT='🤖 AI Command › '"));
         assert!(script.contains("zle recursive-edit"));
-        assert!(script.contains("if (( __aishell_prompt_active )); then\n        zle accept-line"));
+        assert!(script.contains("zle .send-break"));
+        assert!(script.contains("zle -A accept-line __aishell_saved_accept_line"));
+        assert!(script.contains("zle -A __aishell_saved_accept_line accept-line"));
         assert!(script.contains("generated=$(command ai --shell zsh -- \"$request\""));
         assert!(script.contains("BUFFER=$generated"));
         assert!(script.contains("CURSOR=${#BUFFER}"));
-        assert!(script.contains("zle -R '[ai] generating command...'"));
+        assert!(script.contains("BUFFER='✨ Crafting command…'"));
+        assert!(script.contains("BUFFER='✨ Crafting command…'\n    CURSOR=${#BUFFER}"));
         assert!(script.contains("AISHELL_SESSION_ID=\"zsh-$$-$RANDOM-$RANDOM\""));
         assert!(script.contains("bindkey -M $__aishell_keymap '^I' __aishell_tab"));
         assert!(!script.contains("${(k)commands}"));
-        assert!(!script.contains("print -r -- '[ai] generating command...'"));
+        assert!(!script.contains("zle -R '✨ Crafting command…'"));
+        assert!(!script.contains("\n    POSTDISPLAY="));
+        assert!(!script.contains("{{"));
     }
 }

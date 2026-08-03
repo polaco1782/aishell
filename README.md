@@ -102,7 +102,7 @@ Tab behaves according to the current command-line state:
 
 | Current state | What Tab does |
 | --- | --- |
-| The command line is completely empty | Opens the `AI Command>` prompt. |
+| The command line is completely empty | Opens the `🤖 AI Command ›` prompt. |
 | The AI prompt is active | Submits the natural-language request. |
 | Any other text is present | Runs normal shell command/path completion. |
 
@@ -111,8 +111,9 @@ The complete generation flow is:
 1. Press Tab on an empty command line.
 2. Type the desired operation in natural language.
 3. Press Tab again, or press Enter. Both keys submit an active AI prompt.
-4. `aishell` displays a temporary generation status and asks the configured
-   model for either a command, a clarifying question, or an answer.
+4. The AI prompt is replaced in place by `✨ Crafting command…` while
+   `aishell` asks the configured model for either a command, a clarifying
+   question, or an answer.
 5. A generated command replaces the AI request in the same editable line. It
    remains unexecuted so it can be inspected or changed.
 6. Press Enter only after reviewing the generated command to execute it through
@@ -122,14 +123,14 @@ The visible line changes in place. The arrows below represent successive
 contents of one terminal line, not three shell prompts:
 
 ```text
-Bash: $  ->  $ # AI Command> list files  ->  $ ls -la
-Zsh:  $  ->  AI Command> list files      ->  $ ls -la
+Bash: $  ->  $ # 🤖 AI Command › list files  ->  $ ls -la
+Zsh:  $  ->  🤖 AI Command › list files      ->  $ ls -la
 ```
 
-Bash keeps its normal prompt and puts `# AI Command> ` in the Readline buffer.
+Bash keeps its normal prompt and puts `# 🤖 AI Command › ` in the Readline buffer.
 The prefix is a shell comment, so the request is harmless even if another
 Readline customization bypasses the integration. Zsh temporarily changes its
-ZLE prompt to `AI Command>` while collecting the request. In both shells, only
+ZLE prompt to `🤖 AI Command ›` while collecting the request. In both shells, only
 the generated command is placed in the final edit buffer.
 
 ### Commands, questions, and errors

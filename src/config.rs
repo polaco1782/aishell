@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::secure_fs::{atomic_write_private, verify_private_file};
+use crate::ui;
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL: &str = "openrouter/auto";
@@ -177,9 +178,9 @@ pub fn interactive_setup() -> Result<PathBuf> {
     };
 
     let key_prompt = if existing.is_some() {
-        "OpenRouter API key (leave empty to keep the current key): "
+        "🔑 OpenRouter API key (Enter keeps the current key) › "
     } else {
-        "OpenRouter API key: "
+        "🔑 OpenRouter API key › "
     };
     let entered_key =
         rpassword::prompt_password(key_prompt).context("could not read the API key")?;
@@ -192,7 +193,7 @@ pub fn interactive_setup() -> Result<PathBuf> {
     let default_model = existing
         .as_ref()
         .map_or(DEFAULT_MODEL, |config| config.openrouter.model.as_str());
-    print!("OpenRouter model [{default_model}]: ");
+    print!("{} OpenRouter model [{default_model}] › ", ui::AI);
     std::io::stdout()
         .flush()
         .context("could not display setup prompt")?;

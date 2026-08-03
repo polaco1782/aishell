@@ -4,6 +4,7 @@ mod context;
 mod openrouter;
 mod secure_fs;
 mod shell;
+mod ui;
 
 use std::env;
 use std::io::{self, Write};
@@ -18,7 +19,7 @@ use crate::openrouter::{GeneratedOutput, OpenRouterClient};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("ai: {error:#}");
+        eprintln!("{} ai · {error:#}", ui::ERROR);
         std::process::exit(1);
     }
 }
@@ -31,7 +32,7 @@ fn run() -> Result<()> {
         }
         Action::Setup => {
             let path = config::interactive_setup()?;
-            println!("Configuration saved to {}", path.display());
+            println!("{} Configuration saved · {}", ui::SUCCESS, path.display());
             Ok(())
         }
         Action::ConfigPath => {
@@ -67,7 +68,7 @@ fn run() -> Result<()> {
 fn read_interactive_prompt() -> Result<String> {
     // Keep the question on stderr so stdout remains only the generated command,
     // which lets a shell widget safely capture and insert the result.
-    eprint!("AI Command> ");
+    eprint!("{}", ui::AI_PROMPT);
     io::stderr()
         .flush()
         .context("could not display the command prompt")?;
@@ -85,7 +86,7 @@ fn read_interactive_prompt() -> Result<String> {
     if prompt.is_empty() {
         bail!("the command description cannot be empty");
     }
-    eprintln!("[ai] generating command...");
+    eprintln!("{}", ui::THINKING);
     Ok(prompt.to_owned())
 }
 
@@ -100,12 +101,12 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
             Ok(store) => match store.load() {
                 Ok(history) => (Some(store), history),
                 Err(error) => {
-                    eprintln!("[ai] context could not be loaded: {error:#}");
+                    eprintln!("{} Context could not be loaded · {error:#}", ui::WARNING);
                     (None, Vec::new())
                 }
             },
             Err(error) => {
-                eprintln!("[ai] context is unavailable: {error:#}");
+                eprintln!("{} Context is unavailable · {error:#}", ui::WARNING);
                 (None, Vec::new())
             }
         }
@@ -126,15 +127,15 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
             GeneratedOutput::Answer(answer) => ContextResponse::Answer(answer.clone()),
         };
         if let Err(error) = store.append(prompt, &response) {
-            eprintln!("[ai] context could not be saved: {error:#}");
+            eprintln!("{} Context could not be saved · {error:#}", ui::WARNING);
         }
     }
 
     match output {
         GeneratedOutput::Command(command) => println!("{command}"),
         // Non-command responses stay off stdout so shell widgets never insert them.
-        GeneratedOutput::Clarification(question) => eprintln!("[ai] {question}"),
-        GeneratedOutput::Answer(answer) => eprintln!("[ai] {answer}"),
+        GeneratedOutput::Clarification(question) => eprintln!("{} {question}", ui::AI),
+        GeneratedOutput::Answer(answer) => eprintln!("{} {answer}", ui::AI),
     }
     Ok(())
 }
@@ -143,30 +144,33 @@ fn show_context() -> Result<()> {
     let config = Config::load()?;
     let store = ContextStore::open(config.context.max_turns)?;
     let turns = store.load()?;
-    println!("Context: {}", store.scope_description());
-    println!("Database: {}", store.path_ref().display());
+    println!("{} Context · {}", ui::CONTEXT, store.scope_description());
+    println!("{} Database · {}", ui::DATABASE, store.path_ref().display());
     if turns.is_empty() {
-        println!("No saved turns in this context.");
+        println!("{} No saved turns yet.", ui::EMPTY);
         return Ok(());
     }
 
     for (index, turn) in turns.iter().enumerate() {
         println!(
-            "\n{}. [{}] {}",
+            "\n─ {} · {} · {}",
             index + 1,
             turn.created_at,
             turn.working_directory
         );
-        println!("Request: {}", turn.request);
+        println!("{} You · {}", ui::REQUEST, turn.request);
         match &turn.response {
             ContextResponse::Command(command) => {
-                println!("Generated command (execution unconfirmed): {command}");
+                println!(
+                    "{} Command · {command}  (execution unconfirmed)",
+                    ui::COMMAND
+                );
             }
             ContextResponse::Clarification(question) => {
-                println!("Clarification: {question}");
+                println!("{} Question · {question}", ui::AI);
             }
             ContextResponse::Answer(answer) => {
-                println!("Answer: {answer}");
+                println!("{} Answer · {answer}", ui::AI);
             }
         }
     }
@@ -177,9 +181,17 @@ fn clear_context() -> Result<()> {
     let config = Config::load()?;
     let mut store = ContextStore::open(config.context.max_turns)?;
     if store.clear()? {
-        println!("Cleared context for {}.", store.scope_description());
+        println!(
+            "{} Context cleared · {}",
+            ui::SUCCESS,
+            store.scope_description()
+        );
     } else {
-        println!("No saved context for {}.", store.scope_description());
+        println!(
+            "{} Nothing to clear · {}",
+            ui::EMPTY,
+            store.scope_description()
+        );
     }
     Ok(())
 }
@@ -189,7 +201,8 @@ fn check_config() -> Result<()> {
     let client = OpenRouterClient::new(&config)?;
     client.check_key()?;
     println!(
-        "Configuration is valid; OpenRouter authenticated successfully with model {}.",
+        "{} OpenRouter authenticated · {}",
+        ui::SUCCESS,
         config.openrouter.model
     );
     Ok(())
