@@ -118,6 +118,10 @@ Shell integration:
   source <(ai init bash)
   source <(ai init zsh)
 
+Supported integration shells: Bash and Zsh only. Other shells can use the
+standalone CLI, but do not currently receive Tab or edit-buffer integration.
+Supported AI provider: OpenRouter only.
+
 Tab behavior after installing the integration:
   empty command line  open the `AI Command>` prompt
   active AI prompt   submit the request, like Enter

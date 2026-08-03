@@ -1,9 +1,17 @@
-# aishell
+# AIshell
 
 `aishell` turns a natural-language description into a shell command directly
 from the interactive command line. The generated command remains editable and
 is never executed automatically. It can remember the context so it is possible
 to do multiple interactions with the resulting commands.
+
+> [!NOTE]
+> Interactive shell integration is currently available for **Bash and Zsh
+> only**. Other shells can run the standalone `ai` command, but they do not yet
+> have the Tab shortcut or in-place command-line replacement.
+>
+> **OpenRouter is currently the only supported AI provider.** Support for other
+> providers may be added later.
 
 ## Demo
 
@@ -16,6 +24,10 @@ pressing Enter.
 ## Build and configure
 
 Building requires Rust 1.95 or newer.
+
+The current release supports OpenRouter only. An OpenRouter API key and model
+are configured by `ai setup`; provider credentials are read from the private
+configuration file, not environment variables.
 
 ```sh
 cargo build --release
@@ -58,13 +70,26 @@ ai context clear   # forgets the current context
 
 ## Shell integration
 
-Add the matching line to `.bashrc` or `.zshrc`, then open a new shell or run the
-line once in the current shell:
+The edit-buffer integration currently supports these shells:
+
+| Shell | Integration | Configuration |
+| --- | --- | --- |
+| Bash | Readline | Add `source <(ai init bash)` to `.bashrc`. |
+| Zsh | ZLE | Add `source <(ai init zsh)` to `.zshrc`. |
+
+No Fish, Nushell, or other shell integration is provided yet. Those shells can
+still use `ai [description...]` as a normal CLI command, which prints the
+generated command instead of inserting it into the current edit buffer.
+
+After adding the line for the shell in use, open a new shell or source it once
+in the current shell:
 
 ```sh
 source <(ai init bash)
 source <(ai init zsh)
 ```
+
+Use only the line matching the current shell.
 
 `ai init` prints shell code; `source` installs that code in the current shell so
 it can read and replace Bash's Readline buffer or Zsh's ZLE buffer. Re-source
