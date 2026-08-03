@@ -2,17 +2,16 @@
 
 `aishell` turns a natural-language description into a shell command directly
 from the interactive command line. The generated command remains editable and
-is never executed automatically.
+is never executed automatically. It can remember the context so it is possible
+to do multiple interactions with the resulting commands.
 
 ## Demo
 
-![Tab opens the aishell prompt, submits a natural-language request, and replaces it with an editable command](docs/aishell-demo.gif)
+![Tab opens the aishell prompt, submits a natural-language request, and replaces it with an editable command](aishell-demo.gif)
 
 Press Tab on an empty command line, describe the operation, and press Tab again.
 The AI request is replaced in place by a command that can be reviewed before
-pressing Enter. The recording is reproducible from
-[`docs/demo.tape`](docs/demo.tape). It uses a deterministic local response
-fixture, so rendering the demo never reads an API key or contacts a provider.
+pressing Enter.
 
 ## Build and configure
 
