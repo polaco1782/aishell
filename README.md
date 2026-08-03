@@ -1,17 +1,18 @@
 # aishell
 
 `aishell` turns a natural-language description into a shell command directly
-from the interactive command line:
+from the interactive command line. The generated command remains editable and
+is never executed automatically.
 
-```console
-$ # AI Command> run qemu with disk image xyz.vdi<Tab>
-$ qemu-system-x86_64 -drive file=xyz.vdi,format=vdi
-```
+## Demo
 
-The generated command replaces the current Bash or Zsh edit buffer. It is never
-executed automatically, so it can be reviewed and edited before pressing Enter.
-The second line above replaces the first in place; it does not open a new shell
-prompt.
+![Tab opens the aishell prompt, submits a natural-language request, and replaces it with an editable command](docs/aishell-demo.gif)
+
+Press Tab on an empty command line, describe the operation, and press Tab again.
+The AI request is replaced in place by a command that can be reviewed before
+pressing Enter. The recording is reproducible from
+[`docs/demo.tape`](docs/demo.tape). It uses a deterministic local response
+fixture, so rendering the demo never reads an API key or contacts a provider.
 
 ## Build and configure
 
