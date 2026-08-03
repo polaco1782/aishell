@@ -1,0 +1,65 @@
+name: Development build
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Show Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build optimized binary
+        run: cargo build --release --locked
+
+      - name: Package development build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_dir="dist/aishell-linux-x86_64"
+          archive="dist/aishell-development-linux-x86_64.tar.gz"
+
+          mkdir -p "$package_dir"
+          install -m 0755 target/release/ai "$package_dir/ai"
+          install -m 0644 README.md "$package_dir/README.md"
+          printf '%s\n' "$GITHUB_SHA" > "$package_dir/COMMIT"
+
+          tar -C dist -czf "$archive" aishell-linux-x86_64
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload development artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: aishell-development-linux-x86_64-${{ github.sha }}
+          path: |
+            dist/aishell-development-linux-x86_64.tar.gz
+            dist/aishell-development-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
