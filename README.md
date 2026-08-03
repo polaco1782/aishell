@@ -4,13 +4,14 @@
 from the interactive command line:
 
 ```console
-$ <Tab>
-AI Command> run qemu with disk image xyz.vdi
+$ # AI Command> run qemu with disk image xyz.vdi<Tab>
 $ qemu-system-x86_64 -drive file=xyz.vdi,format=vdi
 ```
 
 The generated command replaces the current Bash or Zsh edit buffer. It is never
 executed automatically, so it can be reviewed and edited before pressing Enter.
+The second line above replaces the first in place; it does not open a new shell
+prompt.
 
 ## Build and configure
 
@@ -57,29 +58,76 @@ ai context clear   # forgets the current context
 
 ## Shell integration
 
-Add the matching line to `.bashrc` or `.zshrc`:
+Add the matching line to `.bashrc` or `.zshrc`, then open a new shell or run the
+line once in the current shell:
 
 ```sh
 source <(ai init bash)
 source <(ai init zsh)
 ```
 
-Press Tab on a completely empty command line to switch to the `AI Command>`
-prompt. Type the natural-language request and press Enter. When generation
-finishes, the result is placed in the editable command line as though you had
-typed it, but is not executed.
+`ai init` prints shell code; `source` installs that code in the current shell so
+it can read and replace Bash's Readline buffer or Zsh's ZLE buffer. Re-source
+the integration after installing a new `aishell` version to load updated
+bindings into an already-running shell.
 
-If the command line contains any text, Tab always performs normal shell
-completion. There is no command-or-natural-language classifier. General
-questions such as `what can you do?` receive a conversational response below the
-prompt. If a requested operation needs more detail, `ai` asks a clarifying
-question. Answers and questions leave the command line empty; only generated
-commands are inserted. If generation fails, the error is displayed and the
-command line remains empty.
+### Interactive workflow
 
-The integration binds only Tab in the Bash and Zsh Emacs and vi-insert keymaps.
-A shell setup that assigns custom Tab behavior should load the `ai` integration
-after its completion framework.
+Tab behaves according to the current command-line state:
+
+| Current state | What Tab does |
+| --- | --- |
+| The command line is completely empty | Opens the `AI Command>` prompt. |
+| The AI prompt is active | Submits the natural-language request. |
+| Any other text is present | Runs normal shell command/path completion. |
+
+The complete generation flow is:
+
+1. Press Tab on an empty command line.
+2. Type the desired operation in natural language.
+3. Press Tab again, or press Enter. Both keys submit an active AI prompt.
+4. `aishell` displays a temporary generation status and asks the configured
+   model for either a command, a clarifying question, or an answer.
+5. A generated command replaces the AI request in the same editable line. It
+   remains unexecuted so it can be inspected or changed.
+6. Press Enter only after reviewing the generated command to execute it through
+   the shell normally.
+
+The visible line changes in place. The arrows below represent successive
+contents of one terminal line, not three shell prompts:
+
+```text
+Bash: $  ->  $ # AI Command> list files  ->  $ ls -la
+Zsh:  $  ->  AI Command> list files      ->  $ ls -la
+```
+
+Bash keeps its normal prompt and puts `# AI Command> ` in the Readline buffer.
+The prefix is a shell comment, so the request is harmless even if another
+Readline customization bypasses the integration. Zsh temporarily changes its
+ZLE prompt to `AI Command>` while collecting the request. In both shells, only
+the generated command is placed in the final edit buffer.
+
+### Commands, questions, and errors
+
+Shell-widget output is handled by type:
+
+- A command replaces the current edit buffer and moves the cursor to its end.
+- A clarifying question or general answer is displayed without inserting text
+  that the shell could execute. Press Tab on the empty line again to answer a
+  clarification; the bounded command context connects the follow-up.
+- A generation error displays diagnostics and never executes the request. Bash
+  keeps the request behind its safe comment prefix so it can be edited and
+  retried; Zsh returns to an empty command line.
+
+There is no command-or-natural-language classifier on an existing line. For
+example, `ec<Tab>` and `git che<Tab>` remain ordinary shell completion. AI mode
+starts only from a completely empty buffer, which prevents the integration from
+taking over commands or paths the user is already typing.
+
+The integration binds Tab in the Bash and Zsh Emacs and vi-insert keymaps. Bash
+also wraps Enter so it can submit an active AI prompt while retaining normal
+accept-line behavior everywhere else. A shell setup that assigns custom Tab or
+Enter behavior should load the `ai` integration after its completion framework.
 
 Running `ai` without the shell integration prints the generated command to
 standard output:
@@ -89,7 +137,8 @@ ai list TCP listeners with process names
 ```
 
 If no description is passed, `ai` asks for one interactively before generating
-the command.
+the command. This direct CLI mode cannot replace its parent shell's edit buffer;
+buffer replacement is performed by the sourced Bash or Zsh integration.
 
 ## Command context
 

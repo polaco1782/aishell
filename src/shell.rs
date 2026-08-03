@@ -7,9 +7,9 @@ pub fn init_script(shell: Shell) -> &'static str {
     }
 }
 
-// Bash cannot invoke its normal completion widget from a `bind -x` function.
-// The Tab macro therefore runs the AI hook first, followed by a dynamically
-// selected completion/no-op binding.
+// Bash cannot invoke its normal completion or accept-line widgets from a
+// `bind -x` function. The key macros therefore run the AI hook first, followed
+// by a dynamically selected built-in/no-op binding.
 const BASH_INIT: &str = r#"# Keep related requests in one private conversation without writing into the
 # working directory. A newly started interactive shell receives a new ID.
 if [[ ${AISHELL_SESSION_OWNER_PID-} != "$$" ]]; then
@@ -17,6 +17,8 @@ if [[ ${AISHELL_SESSION_OWNER_PID-} != "$$" ]]; then
     AISHELL_SESSION_ID="bash-$$-$RANDOM-$RANDOM"
     export AISHELL_SESSION_OWNER_PID AISHELL_SESSION_ID
 fi
+
+__aishell_prompt_prefix='# AI Command> '
 
 __aishell_bind_tab_fallback() {
     local binding=$1
@@ -29,49 +31,104 @@ __aishell_bind_tab_fallback() {
     fi
 }
 
-__aishell_tab() {
-    local generated terminal_state
+__aishell_bind_accept_fallback() {
+    local binding=$1
+    if [[ $binding == accept ]]; then
+        bind -m emacs-standard '"\C-x\C-y": accept-line'
+        bind -m vi-insert '"\C-x\C-y": accept-line'
+    else
+        bind -m emacs-standard '"\C-x\C-y": ""'
+        bind -m vi-insert '"\C-x\C-y": ""'
+    fi
+}
+
+__aishell_generate() {
+    local request=${READLINE_LINE#"$__aishell_prompt_prefix"}
+    local generated error_file error_text
     local -i generation_status
 
-    # Any content belongs to the shell, with no command-vs-language guessing.
-    if [[ -n ${READLINE_LINE-} ]]; then
-        __aishell_bind_tab_fallback complete
+    # Keep the safe comment prompt in place until there is a real request.
+    if [[ -z ${request//[[:space:]]/} ]]; then
         return
     fi
 
-    # Readline leaves the terminal in non-canonical mode while a bind-x hook is
-    # running. Restore normal input while the CLI owns the AI Command prompt.
-    if ! terminal_state=$(command stty -g 2>/dev/null); then
-        printf '\n[ai] could not access the terminal\n' >&2
-        __aishell_bind_tab_fallback noop
+    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.bash.XXXXXXXX"); then
+        printf '\r\033[2K[ai] could not create a temporary diagnostics file\n' >&2
         return
     fi
-    printf '\n' >&2
-    if ! command stty icanon echo icrnl -inlcr -igncr; then
-        command stty "$terminal_state"
-        printf '[ai] could not prepare terminal input\n' >&2
-        __aishell_bind_tab_fallback noop
-        return
-    fi
-    generated=$(command ai --shell bash)
+
+    # Do not let child diagnostics invalidate Readline's idea of the current
+    # prompt geometry. A successful command redraws over this status in place.
+    printf '\r\033[2K[ai] generating command...' >&2
+    generated=$(command ai --shell bash -- "$request" 2>"$error_file")
     generation_status=$?
-    command stty "$terminal_state"
+    error_text=$(<"$error_file")
+    command rm -f -- "$error_file"
+    printf '\r\033[2K' >&2
 
     if (( generation_status == 0 )); then
         if [[ -n $generated ]]; then
             READLINE_LINE=$generated
             READLINE_POINT=${#READLINE_LINE}
+        else
+            READLINE_LINE=
+            READLINE_POINT=0
         fi
     else
-        printf '[ai] generation failed\n' >&2
+        if [[ -n $error_text ]]; then
+            printf '%s\n' "$error_text" >&2
+        fi
+        printf '[ai] generation failed; request kept\n' >&2
     fi
+
+    if (( generation_status == 0 )) && [[ -n $error_text ]]; then
+        printf '%s\n' "$error_text" >&2
+    fi
+}
+
+__aishell_tab() {
+    local line=${READLINE_LINE-}
+
+    if [[ $line == "$__aishell_prompt_prefix"* ]]; then
+        __aishell_generate
+        __aishell_bind_tab_fallback noop
+        return
+    fi
+
+    # Any other content belongs to the shell, with no command-vs-language
+    # guessing. Only a completely empty line enters the AI prompt.
+    if [[ -n $line ]]; then
+        __aishell_bind_tab_fallback complete
+        return
+    fi
+
+    # The prefix is a shell comment, so it remains harmless even if another
+    # Readline customization bypasses the accept hook below.
+    READLINE_LINE=$__aishell_prompt_prefix
+    READLINE_POINT=${#READLINE_LINE}
     __aishell_bind_tab_fallback noop
+}
+
+__aishell_accept_or_generate() {
+    if [[ ${READLINE_LINE-} == "$__aishell_prompt_prefix"* ]]; then
+        __aishell_generate
+        # Leave the generated command in Readline for review.
+        __aishell_bind_accept_fallback noop
+    else
+        __aishell_bind_accept_fallback accept
+    fi
 }
 
 bind -m emacs-standard -x '"\C-x\C-a":__aishell_tab'
 bind -m vi-insert -x '"\C-x\C-a":__aishell_tab'
 bind -m emacs-standard '"\C-i":"\C-x\C-a\C-x\C-z"'
 bind -m vi-insert '"\C-i":"\C-x\C-a\C-x\C-z"'
+bind -m emacs-standard -x '"\C-x\C-e":__aishell_accept_or_generate'
+bind -m vi-insert -x '"\C-x\C-e":__aishell_accept_or_generate'
+bind -m emacs-standard '"\C-m":"\C-x\C-e\C-x\C-y"'
+bind -m vi-insert '"\C-m":"\C-x\C-e\C-x\C-y"'
+bind -m emacs-standard '"\C-j":"\C-x\C-e\C-x\C-y"'
+bind -m vi-insert '"\C-j":"\C-x\C-e\C-x\C-y"'
 "#;
 
 const ZSH_INIT: &str = r#"# Re-sourcing the integration keeps this shell's context; a child shell gets a
@@ -83,14 +140,14 @@ fi
 
 __aishell_tab() {
     emulate -L zsh
-    local generated request
+    local generated request error_file error_text status_message
     local original_prompt=$PROMPT
     local original_rprompt=$RPROMPT
     local -i edit_status generation_status
 
     # During the recursive prompt, Tab must not recursively open another one.
     if (( __aishell_prompt_active )); then
-        zle expand-or-complete
+        zle accept-line
         return
     fi
 
@@ -120,20 +177,30 @@ __aishell_tab() {
         return
     fi
 
-    zle -I
-    print -r -- '[ai] generating command...' >&2
-    generated=$(command ai --shell zsh -- "$request")
+    zle -R '[ai] generating command...'
+    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.zsh.XXXXXXXX"); then
+        zle reset-prompt
+        zle -M '[ai] could not create a temporary diagnostics file'
+        return
+    fi
+    generated=$(command ai --shell zsh -- "$request" 2>"$error_file")
     generation_status=$?
+    error_text=$(<"$error_file")
+    command rm -f -- "$error_file"
 
     if (( generation_status == 0 )); then
         if [[ -n $generated ]]; then
             BUFFER=$generated
             CURSOR=${#BUFFER}
         fi
+        status_message=$error_text
     else
-        print -r -- '[ai] generation failed' >&2
+        status_message=${error_text:+$error_text$'\n'}'[ai] generation failed'
     fi
     zle reset-prompt
+    if [[ -n $status_message ]]; then
+        zle -M "$status_message"
+    fi
 }
 
 typeset -gi __aishell_prompt_active=0
@@ -151,16 +218,17 @@ mod tests {
     #[test]
     fn bash_uses_ai_only_for_an_empty_buffer() {
         let script = init_script(Shell::Bash);
-        assert!(script.contains("if [[ -n ${READLINE_LINE-} ]]"));
+        assert!(script.contains("__aishell_prompt_prefix='# AI Command> '"));
+        assert!(script.contains("if [[ -n $line ]]"));
         assert!(script.contains("__aishell_bind_tab_fallback complete"));
-        assert!(script.contains("generated=$(command ai --shell bash)"));
+        assert!(script.contains("generated=$(command ai --shell bash -- \"$request\""));
         assert!(script.contains("READLINE_LINE=$generated"));
         assert!(script.contains("READLINE_POINT=${#READLINE_LINE}"));
-        assert!(script.contains("command stty icanon echo icrnl -inlcr -igncr"));
+        assert!(script.contains("__aishell_accept_or_generate"));
+        assert!(script.contains("[ai] generating command..."));
         assert!(script.contains("AISHELL_SESSION_ID=\"bash-$$-$RANDOM-$RANDOM\""));
         assert!(!script.contains("compgen"));
-        assert!(!script.contains("accept-line"));
-        assert!(!script.contains("__aishell_prompting"));
+        assert!(!script.contains("command stty"));
     }
 
     #[test]
@@ -170,13 +238,14 @@ mod tests {
         assert!(script.contains("zle expand-or-complete"));
         assert!(script.contains("PROMPT='AI Command> '"));
         assert!(script.contains("zle recursive-edit"));
-        assert!(script.contains("generated=$(command ai --shell zsh -- \"$request\")"));
+        assert!(script.contains("if (( __aishell_prompt_active )); then\n        zle accept-line"));
+        assert!(script.contains("generated=$(command ai --shell zsh -- \"$request\""));
         assert!(script.contains("BUFFER=$generated"));
         assert!(script.contains("CURSOR=${#BUFFER}"));
+        assert!(script.contains("zle -R '[ai] generating command...'"));
         assert!(script.contains("AISHELL_SESSION_ID=\"zsh-$$-$RANDOM-$RANDOM\""));
         assert!(script.contains("bindkey -M $__aishell_keymap '^I' __aishell_tab"));
         assert!(!script.contains("${(k)commands}"));
-        assert!(!script.contains("accept-line"));
-        assert!(!script.contains("__aishell_prompting"));
+        assert!(!script.contains("print -r -- '[ai] generating command...'"));
     }
 }

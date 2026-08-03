@@ -118,11 +118,16 @@ Shell integration:
   source <(ai init bash)
   source <(ai init zsh)
 
-After installing the integration, press Tab on an empty command line to open an
-`AI Command>` prompt. Enter a natural-language description there; the generated
-command replaces the editable command line but is not executed. Tab always uses
-normal shell completion when the command line already contains text. General
-questions receive a printed answer instead of a command.
+Tab behavior after installing the integration:
+  empty command line  open the `AI Command>` prompt
+  active AI prompt   submit the request, like Enter
+  any other text     run normal shell completion
+
+A generated command replaces the AI request in the same editable line but is
+not executed. Review or edit it, then press Enter to execute it normally.
+Clarifying questions and general answers are displayed without inserting an
+executable line. The direct `ai [description...]` CLI prints its result because
+only the sourced shell integration can replace its parent shell's edit buffer.
 
 The integration keeps a bounded command-generation context in one private state
 database. Use `ai context show` to inspect the current context or `clear` to
