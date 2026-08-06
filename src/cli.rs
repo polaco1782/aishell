@@ -120,10 +120,10 @@ Shell integration:
 
 Supported integration shells: Bash and Zsh only. Other shells can use the
 standalone CLI, but do not currently receive Tab or edit-buffer integration.
-Supported AI provider: OpenRouter only.
+Supported AI providers: OpenRouter, OpenAI, llama.cpp, and vLLM.
 
 Tab behavior after installing the integration:
-  empty command line  open the `🤖 AI Command ›` prompt
+  empty command line  open the `🤖 AI Prompt ›` prompt
   active AI prompt   submit the request, like Enter
   any other text     run normal shell completion
 

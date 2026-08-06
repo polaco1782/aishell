@@ -11,6 +11,7 @@ pub fn init_script(shell: Shell) -> String {
     template
         .replace("{{AI_PROMPT}}", ui::AI_PROMPT)
         .replace("{{THINKING}}", ui::THINKING)
+        .replace("{{SPINNER_FRAMES}}", ui::SPINNER_FRAMES)
         .replace("{{ERROR}}", ui::ERROR)
 }
 
@@ -51,26 +52,45 @@ __aishell_bind_accept_fallback() {
 
 __aishell_generate() {
     local request=${READLINE_LINE#"$__aishell_prompt_prefix"}
-    local generated error_file error_text
-    local -i generation_status
+    local generated output_file error_file error_text
+    local -a spinner_frames=( {{SPINNER_FRAMES}} )
+    local -i generation_status spinner_index=0
 
     # Keep the safe comment prompt in place until there is a real request.
     if [[ -z ${request//[[:space:]]/} ]]; then
         return
     fi
 
-    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.bash.XXXXXXXX"); then
+    if ! output_file=$(mktemp "${TMPDIR:-/tmp}/aishell.bash.output.XXXXXXXX"); then
+        printf '\r\033[2K{{ERROR}} Could not create a temporary diagnostics file\n' >&2
+        return
+    fi
+    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.bash.error.XXXXXXXX"); then
+        command rm -f -- "$output_file"
         printf '\r\033[2K{{ERROR}} Could not create a temporary diagnostics file\n' >&2
         return
     fi
 
     # Do not let child diagnostics invalidate Readline's idea of the current
-    # prompt geometry. A successful command redraws over this status in place.
-    printf '\r\033[2K{{THINKING}}' >&2
-    generated=$(command ai --shell bash -- "$request" 2>"$error_file")
+    # prompt geometry. Animate in place while stdout and stderr stay isolated.
+    # The foreground subshell owns the background request, keeping Bash job
+    # notices hidden and ensuring an interrupt also terminates the generator.
+    (
+        local generation_pid
+        trap 'kill "$generation_pid" 2>/dev/null; wait "$generation_pid" 2>/dev/null; exit 130' INT TERM HUP
+        command ai --shell bash -- "$request" >"$output_file" 2>"$error_file" &
+        generation_pid=$!
+        while kill -0 "$generation_pid" 2>/dev/null; do
+            printf '\r\033[2K%s {{THINKING}}' "${spinner_frames[spinner_index]}" >&2
+            (( spinner_index = (spinner_index + 1) % ${#spinner_frames[@]} ))
+            command sleep 0.08
+        done
+        wait "$generation_pid"
+    )
     generation_status=$?
+    generated=$(<"$output_file")
     error_text=$(<"$error_file")
-    command rm -f -- "$error_file"
+    command rm -f -- "$output_file" "$error_file"
     printf '\r\033[2K' >&2
 
     if (( generation_status == 0 )); then
@@ -154,10 +174,14 @@ __aishell_submit_prompt() {
 
 __aishell_tab() {
     emulate -L zsh
-    local generated request error_file error_text status_message
+    # Background generation is private widget work, not a user-visible job.
+    unsetopt MONITOR NOTIFY
+    setopt LOCAL_TRAPS
+    local generated request output_file error_file error_text status_message generation_pid
     local original_prompt=$PROMPT
     local original_rprompt=$RPROMPT
-    local -i generation_status
+    local -a spinner_frames=( {{SPINNER_FRAMES}} )
+    local -i generation_status spinner_index=1
 
     # During the recursive prompt, Tab must not recursively open another one.
     if (( __aishell_prompt_active )); then
@@ -201,11 +225,8 @@ __aishell_tab() {
     # POSTDISPLAY would leave the cursor blinking underneath the emoji.
     PROMPT=
     RPROMPT=
-    BUFFER='{{THINKING}}'
-    CURSOR=${#BUFFER}
     zle reset-prompt
-    zle -R
-    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.zsh.XXXXXXXX"); then
+    if ! output_file=$(mktemp "${TMPDIR:-/tmp}/aishell.zsh.output.XXXXXXXX"); then
         BUFFER=
         CURSOR=0
         PROMPT=$original_prompt
@@ -214,10 +235,32 @@ __aishell_tab() {
         zle -M '{{ERROR}} Could not create a temporary diagnostics file'
         return
     fi
-    generated=$(command ai --shell zsh -- "$request" 2>"$error_file")
+    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/aishell.zsh.error.XXXXXXXX"); then
+        command rm -f -- "$output_file"
+        BUFFER=
+        CURSOR=0
+        PROMPT=$original_prompt
+        RPROMPT=$original_rprompt
+        zle reset-prompt
+        zle -M '{{ERROR}} Could not create a temporary diagnostics file'
+        return
+    fi
+
+    command ai --shell zsh -- "$request" >"$output_file" 2>"$error_file" &
+    generation_pid=$!
+    trap 'kill "$generation_pid" 2>/dev/null' INT TERM HUP
+    while kill -0 "$generation_pid" 2>/dev/null; do
+        BUFFER="${spinner_frames[spinner_index]} {{THINKING}}"
+        CURSOR=${#BUFFER}
+        zle -R
+        (( spinner_index = spinner_index % ${#spinner_frames} + 1 ))
+        command sleep 0.08
+    done
+    wait "$generation_pid"
     generation_status=$?
+    generated=$(<"$output_file")
     error_text=$(<"$error_file")
-    command rm -f -- "$error_file"
+    command rm -f -- "$output_file" "$error_file"
 
     BUFFER=
     CURSOR=0
@@ -255,14 +298,18 @@ mod tests {
     #[test]
     fn bash_uses_ai_only_for_an_empty_buffer() {
         let script = init_script(Shell::Bash);
-        assert!(script.contains("__aishell_prompt_prefix='# 🤖 AI Command › '"));
+        assert!(script.contains("__aishell_prompt_prefix='# 🤖 AI Prompt › '"));
         assert!(script.contains("if [[ -n $line ]]"));
         assert!(script.contains("__aishell_bind_tab_fallback complete"));
-        assert!(script.contains("generated=$(command ai --shell bash -- \"$request\""));
+        assert!(script.contains("command ai --shell bash -- \"$request\" >\"$output_file\""));
         assert!(script.contains("READLINE_LINE=$generated"));
         assert!(script.contains("READLINE_POINT=${#READLINE_LINE}"));
         assert!(script.contains("__aishell_accept_or_generate"));
         assert!(script.contains("✨ Crafting command…"));
+        assert!(script.contains("spinner_frames=( ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏ )"));
+        assert!(script.contains("command sleep 0.08"));
+        assert!(script.contains("aishell.bash.output.XXXXXXXX"));
+        assert!(script.contains("aishell.bash.error.XXXXXXXX"));
         assert!(!script.contains("{{"));
         assert!(script.contains("AISHELL_SESSION_ID=\"bash-$$-$RANDOM-$RANDOM\""));
         assert!(!script.contains("compgen"));
@@ -274,16 +321,21 @@ mod tests {
         let script = init_script(Shell::Zsh);
         assert!(script.contains("if [[ -n $BUFFER ]]"));
         assert!(script.contains("zle expand-or-complete"));
-        assert!(script.contains("PROMPT='🤖 AI Command › '"));
+        assert!(script.contains("PROMPT='🤖 AI Prompt › '"));
         assert!(script.contains("zle recursive-edit"));
         assert!(script.contains("zle .send-break"));
         assert!(script.contains("zle -A accept-line __aishell_saved_accept_line"));
         assert!(script.contains("zle -A __aishell_saved_accept_line accept-line"));
-        assert!(script.contains("generated=$(command ai --shell zsh -- \"$request\""));
+        assert!(script.contains("command ai --shell zsh -- \"$request\" >\"$output_file\""));
         assert!(script.contains("BUFFER=$generated"));
         assert!(script.contains("CURSOR=${#BUFFER}"));
-        assert!(script.contains("BUFFER='✨ Crafting command…'"));
-        assert!(script.contains("BUFFER='✨ Crafting command…'\n    CURSOR=${#BUFFER}"));
+        assert!(
+            script.contains("BUFFER=\"${spinner_frames[spinner_index]} ✨ Crafting command…\"")
+        );
+        assert!(script.contains("command sleep 0.08"));
+        assert!(script.contains("unsetopt MONITOR NOTIFY"));
+        assert!(script.contains("aishell.zsh.output.XXXXXXXX"));
+        assert!(script.contains("aishell.zsh.error.XXXXXXXX"));
         assert!(script.contains("AISHELL_SESSION_ID=\"zsh-$$-$RANDOM-$RANDOM\""));
         assert!(script.contains("bindkey -M $__aishell_keymap '^I' __aishell_tab"));
         assert!(!script.contains("${(k)commands}"));

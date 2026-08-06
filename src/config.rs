@@ -1,15 +1,16 @@
 use std::env;
 use std::io::{IsTerminal, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::provider::Provider;
 use crate::secure_fs::{atomic_write_private, verify_private_file};
 use crate::ui;
 
-const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const DEFAULT_MODEL: &str = "openrouter/auto";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 256;
 const DEFAULT_CONTEXT_MAX_TURNS: usize = 6;
@@ -17,7 +18,7 @@ const DEFAULT_CONTEXT_MAX_TURNS: usize = 6;
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub openrouter: OpenRouterConfig,
+    pub provider: ProviderConfig,
     #[serde(default)]
     pub generation: GenerationConfig,
     #[serde(default)]
@@ -26,11 +27,12 @@ pub struct Config {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OpenRouterConfig {
-    pub api_key: String,
-    #[serde(default = "default_model")]
+pub struct ProviderConfig {
+    #[serde(rename = "type")]
+    pub kind: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     pub model: String,
-    #[serde(default = "default_base_url")]
     pub base_url: String,
 }
 
@@ -90,37 +92,53 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
+        let contents = Self::read_from(path)?;
+        Self::parse_from(&contents, path)
+    }
+
+    fn read_from(path: &Path) -> Result<String> {
         verify_private_file(path, "configuration")?;
-        let contents = std::fs::read_to_string(path).with_context(|| {
+        std::fs::read_to_string(path).with_context(|| {
             format!(
                 "could not read {}; run `ai setup` to create it",
                 path.display()
             )
-        })?;
-        let config: Self = toml::from_str(&contents)
+        })
+    }
+
+    fn parse_from(contents: &str, path: &Path) -> Result<Self> {
+        let config: Self = toml::from_str(contents)
             .with_context(|| format!("invalid configuration in {}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
-        let key = self.openrouter.api_key.trim();
-        if key.is_empty() {
-            bail!("openrouter.api_key cannot be empty");
+        let key = self.provider.api_key.as_deref().map(str::trim);
+        if key.is_some_and(str::is_empty) {
+            bail!("provider.api_key cannot be empty");
         }
-        if key.chars().any(char::is_control) {
-            bail!("openrouter.api_key cannot contain control characters");
+        if self.provider.kind.requires_api_key() && key.is_none() {
+            bail!("provider.api_key is required for {}", self.provider.kind);
+        }
+        if key.is_some_and(|key| key.chars().any(char::is_control)) {
+            bail!("provider.api_key cannot contain control characters");
         }
 
-        let model = self.openrouter.model.trim();
+        let model = self.provider.model.trim();
         if model.is_empty() || model.chars().any(char::is_whitespace) {
-            bail!("openrouter.model must be a nonempty OpenRouter model slug");
+            bail!(
+                "provider.model must be a nonempty {} model identifier",
+                self.provider.kind
+            );
         }
 
-        let url = reqwest::Url::parse(self.openrouter.base_url.trim())
-            .context("openrouter.base_url is not a valid URL")?;
-        if url.scheme() != "https" {
-            bail!("openrouter.base_url must use HTTPS");
+        let url = reqwest::Url::parse(self.provider.base_url.trim())
+            .context("provider.base_url is not a valid URL")?;
+        if url.scheme() != "https"
+            && !(url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host))
+        {
+            bail!("provider.base_url must use HTTPS, except for loopback HTTP servers");
         }
         if url.host_str().is_none()
             || !url.username().is_empty()
@@ -129,7 +147,7 @@ impl Config {
             || url.fragment().is_some()
         {
             bail!(
-                "openrouter.base_url must be an HTTPS origin and path without credentials or query parameters"
+                "provider.base_url must be an HTTP(S) origin and path without credentials or query parameters"
             );
         }
 
@@ -147,10 +165,17 @@ impl Config {
     }
 
     pub fn redacted_toml(&self) -> String {
+        let api_key = self
+            .provider
+            .api_key
+            .as_ref()
+            .map(|_| "api_key = \"<redacted>\"\n")
+            .unwrap_or_default();
         format!(
-            "[openrouter]\napi_key = \"<redacted>\"\nmodel = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n",
-            self.openrouter.model,
-            self.openrouter.base_url,
+            "[provider]\ntype = {:?}\n{api_key}model = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n",
+            self.provider.kind.as_str(),
+            self.provider.model,
+            self.provider.base_url,
             self.generation.timeout_seconds,
             self.generation.max_output_tokens,
             self.context.enabled,
@@ -172,39 +197,84 @@ pub fn interactive_setup() -> Result<PathBuf> {
 
     let path = Config::path()?;
     let existing = if path.exists() {
-        Some(Config::load_from(&path)?)
+        let contents = Config::read_from(&path)?;
+        match Config::parse_from(&contents, &path) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!(
+                    "{} Existing configuration is invalid and will be replaced if setup completes · {error:#}",
+                    ui::WARNING
+                );
+                None
+            }
+        }
     } else {
         None
     };
 
-    let key_prompt = if existing.is_some() {
-        "🔑 OpenRouter API key (Enter keeps the current key) › "
-    } else {
-        "🔑 OpenRouter API key › "
+    let default_provider = existing
+        .as_ref()
+        .map_or(Provider::OpenRouter, |config| config.provider.kind);
+    println!("{} AI provider", ui::AI);
+    println!("  1) OpenRouter");
+    println!("  2) OpenAI");
+    println!("  3) llama.cpp");
+    println!("  4) vLLM");
+    let selected_provider = prompt_value(
+        &format!("Select provider [{}] › ", default_provider.as_str()),
+        Some(default_provider.as_str()),
+    )?;
+    let provider = Provider::from_str(&selected_provider)?;
+    let existing_provider = existing
+        .as_ref()
+        .filter(|config| config.provider.kind == provider);
+
+    let key_prompt = match (existing_provider, provider.requires_api_key()) {
+        (Some(_), true) => format!(
+            "🔑 {} API key (Enter keeps the current key) › ",
+            provider.display_name()
+        ),
+        (None, true) => format!("🔑 {} API key › ", provider.display_name()),
+        (Some(_), false) => format!(
+            "🔑 {} API key (optional; Enter keeps it, - clears it) › ",
+            provider.display_name()
+        ),
+        (None, false) => format!("🔑 {} API key (optional) › ", provider.display_name()),
     };
     let entered_key =
         rpassword::prompt_password(key_prompt).context("could not read the API key")?;
-    let api_key = match (entered_key.trim(), existing.as_ref()) {
-        ("", Some(config)) => config.openrouter.api_key.clone(),
-        ("", None) => bail!("an OpenRouter API key is required"),
-        (value, _) => value.to_owned(),
+    let api_key = match (entered_key.trim(), existing_provider) {
+        ("-", _) if !provider.requires_api_key() => None,
+        ("", Some(config)) => config.provider.api_key.clone(),
+        ("", None) if provider.requires_api_key() => {
+            bail!("a {} API key is required", provider.display_name())
+        }
+        ("", None) => None,
+        (value, _) => Some(value.to_owned()),
     };
 
-    let default_model = existing
-        .as_ref()
-        .map_or(DEFAULT_MODEL, |config| config.openrouter.model.as_str());
-    print!("{} OpenRouter model [{default_model}] › ", ui::AI);
-    std::io::stdout()
-        .flush()
-        .context("could not display setup prompt")?;
-    let mut entered_model = String::new();
-    std::io::stdin()
-        .read_line(&mut entered_model)
-        .context("could not read the model")?;
-    let model = match entered_model.trim() {
-        "" => default_model.to_owned(),
-        value => value.to_owned(),
-    };
+    let default_model = existing_provider
+        .map(|config| config.provider.model.as_str())
+        .or_else(|| provider.default_model());
+    let model_prompt = default_model.map_or_else(
+        || format!("{} {} served model › ", ui::AI, provider.display_name()),
+        |model| format!("{} {} model [{model}] › ", ui::AI, provider.display_name()),
+    );
+    let model = prompt_value(&model_prompt, default_model)?;
+    if model.is_empty() {
+        bail!("a {} model identifier is required", provider.display_name());
+    }
+
+    let default_base_url = existing_provider.map_or(provider.default_base_url(), |config| {
+        config.provider.base_url.as_str()
+    });
+    let base_url = prompt_value(
+        &format!(
+            "{} API base URL [{default_base_url}] › ",
+            provider.display_name()
+        ),
+        Some(default_base_url),
+    )?;
 
     let generation = existing
         .as_ref()
@@ -215,13 +285,11 @@ pub fn interactive_setup() -> Result<PathBuf> {
         .map(|config| config.context.clone())
         .unwrap_or_default();
     let config = Config {
-        openrouter: OpenRouterConfig {
+        provider: ProviderConfig {
+            kind: provider,
             api_key,
             model,
-            base_url: existing.as_ref().map_or_else(
-                || DEFAULT_BASE_URL.to_owned(),
-                |config| config.openrouter.base_url.clone(),
-            ),
+            base_url,
         },
         generation,
         context,
@@ -230,12 +298,27 @@ pub fn interactive_setup() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn default_model() -> String {
-    DEFAULT_MODEL.to_owned()
+fn prompt_value(prompt: &str, default: Option<&str>) -> Result<String> {
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .context("could not display setup prompt")?;
+    let mut entered = String::new();
+    std::io::stdin()
+        .read_line(&mut entered)
+        .context("could not read setup input")?;
+    Ok(match entered.trim() {
+        "" => default.unwrap_or_default().to_owned(),
+        value => value.to_owned(),
+    })
 }
 
-fn default_base_url() -> String {
-    DEFAULT_BASE_URL.to_owned()
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 const fn default_timeout_seconds() -> u64 {
@@ -260,12 +343,15 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Config, ContextConfig, GenerationConfig, OpenRouterConfig};
+    use std::str::FromStr;
+
+    use super::{Config, ContextConfig, GenerationConfig, Provider, ProviderConfig};
 
     fn config() -> Config {
         Config {
-            openrouter: OpenRouterConfig {
-                api_key: "secret-value".into(),
+            provider: ProviderConfig {
+                kind: Provider::OpenRouter,
+                api_key: Some("secret-value".into()),
                 model: "openrouter/auto".into(),
                 base_url: "https://openrouter.ai/api/v1".into(),
             },
@@ -281,8 +367,9 @@ mod tests {
         config().save_to(&path).unwrap();
 
         let loaded = Config::load_from(&path).unwrap();
-        assert_eq!(loaded.openrouter.api_key, "secret-value");
-        assert_eq!(loaded.openrouter.model, "openrouter/auto");
+        assert_eq!(loaded.provider.kind, Provider::OpenRouter);
+        assert_eq!(loaded.provider.api_key.as_deref(), Some("secret-value"));
+        assert_eq!(loaded.provider.model, "openrouter/auto");
 
         #[cfg(unix)]
         {
@@ -303,18 +390,93 @@ mod tests {
     }
 
     #[test]
-    fn older_configuration_gets_default_context_settings() {
+    fn provider_configuration_gets_default_generation_and_context_settings() {
         let parsed: Config = toml::from_str(
-            r#"[openrouter]
+            r#"[provider]
+type = "openai"
 api_key = "secret-value"
-model = "openrouter/auto"
-base_url = "https://openrouter.ai/api/v1"
+model = "gpt-5.6-luna"
+base_url = "https://api.openai.com/v1"
 "#,
         )
         .unwrap();
 
         assert!(parsed.context.enabled);
         assert_eq!(parsed.context.max_turns, 6);
+    }
+
+    #[test]
+    fn rejects_the_obsolete_openrouter_only_schema() {
+        let parsed = toml::from_str::<Config>(
+            r#"[openrouter]
+api_key = "secret-value"
+model = "openrouter/auto"
+base_url = "https://openrouter.ai/api/v1"
+"#,
+        );
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn parses_interactive_provider_choices() {
+        assert_eq!(Provider::from_str("1").unwrap(), Provider::OpenRouter);
+        assert_eq!(
+            Provider::from_str("openrouter").unwrap(),
+            Provider::OpenRouter
+        );
+        assert_eq!(Provider::from_str("2").unwrap(), Provider::OpenAi);
+        assert_eq!(Provider::from_str("OpenAI").unwrap(), Provider::OpenAi);
+        assert_eq!(Provider::from_str("3").unwrap(), Provider::LlamaCpp);
+        assert_eq!(Provider::from_str("llama.cpp").unwrap(), Provider::LlamaCpp);
+        assert_eq!(Provider::from_str("4").unwrap(), Provider::Vllm);
+        assert!(Provider::from_str("other").is_err());
+    }
+
+    #[test]
+    fn redacted_openai_configuration_uses_the_selected_provider() {
+        let mut config = config();
+        config.provider = ProviderConfig {
+            kind: Provider::OpenAi,
+            api_key: Some("openai-secret".into()),
+            model: "gpt-5.6-luna".into(),
+            base_url: "https://api.openai.com/v1".into(),
+        };
+
+        let shown = config.redacted_toml();
+        assert!(shown.contains("type = \"openai\""));
+        assert!(shown.contains("model = \"gpt-5.6-luna\""));
+        assert!(!shown.contains("openai-secret"));
+    }
+
+    #[test]
+    fn accepts_keyless_loopback_servers() {
+        for (kind, base_url) in [
+            (Provider::LlamaCpp, "http://127.0.0.1:8080/v1"),
+            (Provider::Vllm, "http://[::1]:8000/v1"),
+        ] {
+            let mut config = config();
+            config.provider = ProviderConfig {
+                kind,
+                api_key: None,
+                model: "local-model".into(),
+                base_url: base_url.into(),
+            };
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unencrypted_remote_servers() {
+        let mut config = config();
+        config.provider = ProviderConfig {
+            kind: Provider::Vllm,
+            api_key: None,
+            model: "local-model".into(),
+            base_url: "http://inference.example/v1".into(),
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[cfg(unix)]

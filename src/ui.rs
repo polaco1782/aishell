@@ -1,5 +1,6 @@
-pub const AI_PROMPT: &str = "🤖 AI Command › ";
+pub const AI_PROMPT: &str = "🤖 AI Prompt › ";
 pub const THINKING: &str = "✨ Crafting command…";
+pub const SPINNER_FRAMES: &str = "⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏";
 
 pub const AI: &str = "🤖";
 pub const SUCCESS: &str = "✓";

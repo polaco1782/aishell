@@ -1,7 +1,7 @@
 mod cli;
 mod config;
 mod context;
-mod openrouter;
+mod provider;
 mod secure_fs;
 mod shell;
 mod ui;
@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{Action, Shell};
 use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
-use crate::openrouter::{GeneratedOutput, OpenRouterClient};
+use crate::provider::{AiClient, GeneratedOutput};
 
 fn main() {
     if let Err(error) = run() {
@@ -92,7 +92,7 @@ fn read_interactive_prompt() -> Result<String> {
 
 fn generate(shell: Shell, prompt: &str) -> Result<()> {
     let config = Config::load()?;
-    let client = OpenRouterClient::new(&config)?;
+    let client = AiClient::new(&config)?;
     let fallback_directory = env::current_dir()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "<unknown>".into());
@@ -198,12 +198,13 @@ fn clear_context() -> Result<()> {
 
 fn check_config() -> Result<()> {
     let config = Config::load()?;
-    let client = OpenRouterClient::new(&config)?;
-    client.check_key()?;
+    let client = AiClient::new(&config)?;
+    client.check()?;
     println!(
-        "{} OpenRouter authenticated · {}",
+        "{} {} ready · {}",
         ui::SUCCESS,
-        config.openrouter.model
+        config.provider.kind,
+        config.provider.model
     );
     Ok(())
 }

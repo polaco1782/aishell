@@ -10,8 +10,9 @@ to do multiple interactions with the resulting commands.
 > only**. Other shells can run the standalone `ai` command, but they do not yet
 > have the Tab shortcut or in-place command-line replacement.
 >
-> **OpenRouter is currently the only supported AI provider.** Support for other
-> providers may be added later.
+> Supported AI providers are **OpenRouter**, **OpenAI**, **llama.cpp**, and
+> **vLLM**. llama.cpp and vLLM use their OpenAI-compatible Chat Completions
+> servers.
 
 ## Demo
 
@@ -25,9 +26,9 @@ pressing Enter.
 
 Building requires Rust 1.95 or newer.
 
-The current release supports OpenRouter only. An OpenRouter API key and model
-are configured by `ai setup`; provider credentials are read from the private
-configuration file, not environment variables.
+The provider, model, endpoint, and optional credentials are configured by
+`ai setup`; provider credentials are read from the private configuration file,
+not environment variables.
 
 ```sh
 cargo build --release
@@ -35,18 +36,24 @@ cargo install --path .
 ai setup
 ```
 
-`ai setup` asks for an OpenRouter API key without echoing it and writes the
-configuration to `~/.config/aishell/config.toml`. If `XDG_CONFIG_HOME` is an
-absolute path, it is used instead. The directory and file are created with modes
-`0700` and `0600` respectively.
+`ai setup` interactively selects OpenRouter, OpenAI, llama.cpp, or vLLM, then
+asks for that provider's model and API base URL. API keys are required for
+OpenRouter and OpenAI and optional for authenticated llama.cpp or vLLM servers;
+key input is never echoed. The configuration is written to
+`~/.config/aishell/config.toml`. If `XDG_CONFIG_HOME` is an absolute path, it is
+used instead. The directory and file are created with modes `0700` and `0600`
+respectively.
 
-An example configuration is:
+The provider configuration schema is intentionally current-only. After updating
+from an OpenRouter-only version, run `ai setup` to replace the old configuration.
+An OpenAI example is:
 
 ```toml
-[openrouter]
-api_key = "sk-or-v1-..."
-model = "openrouter/auto"
-base_url = "https://openrouter.ai/api/v1"
+[provider]
+type = "openai"
+api_key = "sk-..."
+model = "gpt-5.6-luna"
+base_url = "https://api.openai.com/v1"
 
 [generation]
 timeout_seconds = 20
@@ -62,11 +69,25 @@ Useful configuration commands:
 ```sh
 ai config path
 ai config show     # API key is redacted
-ai config check    # validates the key with OpenRouter
+ai config check    # checks authentication, endpoint, and configured model
 ai context path    # prints the central history database path
 ai context show    # shows the current bounded context
 ai context clear   # forgets the current context
 ```
+
+Provider defaults used by `ai setup`:
+
+| Provider | API base URL | Model/key behavior |
+| --- | --- | --- |
+| OpenRouter | `https://openrouter.ai/api/v1` | Defaults to `openrouter/auto`; API key required. |
+| OpenAI | `https://api.openai.com/v1` | Defaults to `gpt-5.6-luna`; API key required. |
+| llama.cpp | `http://127.0.0.1:8080/v1` | Served model is prompted; API key optional. |
+| vLLM | `http://127.0.0.1:8000/v1` | Served model is prompted; API key optional. |
+
+Plain HTTP endpoints are accepted only on loopback addresses. Remote provider
+URLs must use HTTPS. `ai config check` uses OpenRouter's key endpoint, OpenAI's
+authenticated model endpoint, or the OpenAI-compatible model catalog for
+llama.cpp and vLLM.
 
 ## Shell integration
 
@@ -102,7 +123,7 @@ Tab behaves according to the current command-line state:
 
 | Current state | What Tab does |
 | --- | --- |
-| The command line is completely empty | Opens the `🤖 AI Command ›` prompt. |
+| The command line is completely empty | Opens the `🤖 AI Prompt ›` prompt. |
 | The AI prompt is active | Submits the natural-language request. |
 | Any other text is present | Runs normal shell command/path completion. |
 
@@ -111,9 +132,9 @@ The complete generation flow is:
 1. Press Tab on an empty command line.
 2. Type the desired operation in natural language.
 3. Press Tab again, or press Enter. Both keys submit an active AI prompt.
-4. The AI prompt is replaced in place by `✨ Crafting command…` while
-   `aishell` asks the configured model for either a command, a clarifying
-   question, or an answer.
+4. The AI prompt is replaced in place by an animated dot spinner such as
+   `⠋ ✨ Crafting command…` while `aishell` asks the configured model for either
+   a command, a clarifying question, or an answer.
 5. A generated command replaces the AI request in the same editable line. It
    remains unexecuted so it can be inspected or changed.
 6. Press Enter only after reviewing the generated command to execute it through
@@ -123,14 +144,14 @@ The visible line changes in place. The arrows below represent successive
 contents of one terminal line, not three shell prompts:
 
 ```text
-Bash: $  ->  $ # 🤖 AI Command › list files  ->  $ ls -la
-Zsh:  $  ->  🤖 AI Command › list files      ->  $ ls -la
+Bash: $  ->  $ # 🤖 AI Prompt › list files  ->  $ ls -la
+Zsh:  $  ->  🤖 AI Prompt › list files      ->  $ ls -la
 ```
 
-Bash keeps its normal prompt and puts `# 🤖 AI Command › ` in the Readline buffer.
+Bash keeps its normal prompt and puts `# 🤖 AI Prompt › ` in the Readline buffer.
 The prefix is a shell comment, so the request is harmless even if another
 Readline customization bypasses the integration. Zsh temporarily changes its
-ZLE prompt to `🤖 AI Command ›` while collecting the request. In both shells, only
+ZLE prompt to `🤖 AI Prompt ›` while collecting the request. In both shells, only
 the generated command is placed in the final edit buffer.
 
 ### Commands, questions, and errors
