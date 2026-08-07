@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::cli::Shell;
 use crate::config::Config;
 use crate::context::ContextTurn;
+use crate::system_info::SystemInfo;
 
 mod llama_cpp;
 mod openai;
@@ -163,11 +164,12 @@ impl AiClient {
         shell: Shell,
         history: &[ContextTurn],
         working_directory: &str,
+        system_info: &SystemInfo,
     ) -> Result<GeneratedOutput, ProviderError> {
         let body = ChatRequest::new(
             self.provider,
             &self.model,
-            chat_messages(shell, history, working_directory, request),
+            chat_messages(shell, history, working_directory, system_info, request),
             self.max_output_tokens,
         );
         let response = self
@@ -381,8 +383,11 @@ requests it. Quote concrete paths and values safely for {}. Do not invent placeh
 user supplied concrete values. Previous request/response pairs may be included to resolve \
 references and preserve concrete paths, names, and values. Their commands were only inserted into \
 an editable shell buffer: they may have been changed or never executed, so never claim their \
-effects occurred. A new command will also be shown for review and must not be described as already \
-executed.",
+effects occurred. Host system metadata in the current request is factual local context. For \
+platform-dependent commands, use it to select commands and packages compatible with the reported \
+operating system, distribution family, and version. Do not assume a different distribution or \
+package manager unless the user requests one. A new command will also be shown for review and must \
+not be described as already executed.",
         shell.as_str(),
         shell.as_str()
     )
@@ -392,6 +397,7 @@ fn chat_messages(
     shell: Shell,
     history: &[ContextTurn],
     working_directory: &str,
+    system_info: &SystemInfo,
     request: &str,
 ) -> Vec<Message> {
     let mut messages = Vec::with_capacity(2 + history.len() * 2);
@@ -411,7 +417,7 @@ fn chat_messages(
     }
     messages.push(Message {
         role: "user",
-        content: user_prompt(working_directory, request),
+        content: user_prompt(working_directory, system_info, request),
     });
     messages
 }
@@ -423,12 +429,10 @@ fn historical_user_prompt(turn: &ContextTurn) -> String {
     )
 }
 
-fn user_prompt(working_directory: &str, request: &str) -> String {
+fn user_prompt(working_directory: &str, system_info: &SystemInfo, request: &str) -> String {
     format!(
-        "Operating system: {}\nArchitecture: {}\nCurrent working directory: \
-{}\nCurrent request:\n{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
+        "Host system metadata: {}\nCurrent working directory: {}\nCurrent request:\n{}",
+        system_info.model_context(),
         working_directory,
         request
     )
@@ -591,6 +595,7 @@ mod tests {
 
     use crate::cli::Shell;
     use crate::context::{ContextResponse, ContextTurn};
+    use crate::system_info::SystemInfo;
 
     use super::{
         ChatRequest, GeneratedOutput, Message, Provider, ProviderError, chat_messages,
@@ -660,10 +665,12 @@ mod tests {
             request: "create a 50 meg file named disk.img".into(),
             response: ContextResponse::Command("truncate -s 50M disk.img".into()),
         }];
+        let system_info = SystemInfo::detect();
         let messages = chat_messages(
             Shell::Bash,
             &history,
             "/tmp/images",
+            &system_info,
             "create a filesystem on it",
         );
 
@@ -673,6 +680,7 @@ mod tests {
         assert_eq!(messages[2].role, "assistant");
         assert_eq!(messages[2].content, "COMMAND: truncate -s 50M disk.img");
         assert!(messages[3].content.contains("create a filesystem on it"));
+        assert!(messages[3].content.contains(&system_info.model_context()));
         assert!(
             messages[0]
                 .content
@@ -680,6 +688,7 @@ mod tests {
         );
         assert!(messages[0].content.contains("ANSWER:"));
         assert!(messages[0].content.contains("what can you do?"));
+        assert!(messages[0].content.contains("distribution family"));
     }
 
     #[test]

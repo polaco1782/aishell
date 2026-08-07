@@ -208,6 +208,13 @@ inserted for review, but cannot assume the user executed it unchanged. Set
 `context.enabled = false` to disable history, reduce `context.max_turns` to send
 less history, or use `ai context clear` to erase the current context.
 
+Each request includes the host OS family and architecture. On Linux, `aishell`
+also reads the standard public `/etc/os-release` file, falling back to
+`/usr/lib/os-release`, and sends only its distribution ID, version ID, codename,
+and distribution-family IDs. This lets the model choose package commands that
+match Debian-, Fedora-, and other Linux families without exposing arbitrary
+files or environment values.
+
 Use `ai -- <description>` when a description exactly matches one of the
 management commands shown above.
 

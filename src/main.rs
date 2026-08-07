@@ -4,6 +4,7 @@ mod context;
 mod provider;
 mod secure_fs;
 mod shell;
+mod system_info;
 mod ui;
 
 use std::env;
@@ -16,6 +17,7 @@ use crate::cli::{Action, Shell};
 use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
 use crate::provider::{AiClient, GeneratedOutput};
+use crate::system_info::SystemInfo;
 
 fn main() {
     if let Err(error) = run() {
@@ -116,7 +118,8 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
     let working_directory = context
         .as_ref()
         .map_or(fallback_directory.as_str(), ContextStore::working_directory);
-    let output = client.generate(prompt, shell, &history, working_directory)?;
+    let system_info = SystemInfo::detect();
+    let output = client.generate(prompt, shell, &history, working_directory, &system_info)?;
 
     if let Some(store) = context.as_mut() {
         let response = match &output {
