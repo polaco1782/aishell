@@ -22,6 +22,32 @@ Press Tab on an empty command line, describe the operation, and press Tab again.
 The AI request is replaced in place by a command that can be reviewed before
 pressing Enter.
 
+## Examples
+
+Requests can be as short or as specific as needed:
+
+```text
+show the ten largest files in this project, excluding target
+which process is listening on port 8080?
+show commits that changed src/provider.rs this month
+install ripgrep using my system's package manager
+create a tar.gz containing log files modified in the last seven days
+what does chmod 2750 mean?
+```
+
+Follow-ups reuse the bounded context for the current shell and working tree. For
+example:
+
+```text
+create a 512 MiB sparse disk image named test.img
+format it as ext4
+now show me how to mount it read-only under /mnt/test
+```
+
+Each generated command is still only inserted into the editable command line.
+Review commands carefully—especially package-management, formatting, and
+privileged operations—before deciding whether to run them.
+
 ## Build and configure
 
 Building requires Rust 1.95 or newer.
@@ -88,6 +114,60 @@ Plain HTTP endpoints are accepted only on loopback addresses. Remote provider
 URLs must use HTTPS. `ai config check` uses OpenRouter's key endpoint, OpenAI's
 authenticated model endpoint, or the OpenAI-compatible model catalog for
 llama.cpp and vLLM.
+
+### Local llama.cpp setup
+
+If `llama-server` is not already installed, build it from the official
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) repository:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git
+cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build llama.cpp/build --config Release --target llama-server -j
+```
+
+Start the OpenAI-compatible server with a GGUF chat model. This small model is a
+convenient first test; replace it with another llama.cpp-compatible model that
+fits the available RAM or VRAM:
+
+```sh
+./llama.cpp/build/bin/llama-server \
+  -hf ggml-org/gemma-3-1b-it-GGUF \
+  --alias local-command-model \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+The first launch downloads the model from Hugging Face. `--alias` gives the
+served model a stable identifier for `aishell`; leave this server running and,
+in another terminal, configure the client:
+
+```sh
+ai setup
+# Select provider 3 (llama.cpp).
+# Leave the optional API key empty.
+# Enter local-command-model as the served model.
+# Accept http://127.0.0.1:8080/v1 as the API base URL.
+
+ai config check
+ai show the five largest files in this directory
+```
+
+The equivalent provider section in `~/.config/aishell/config.toml` is:
+
+```toml
+[provider]
+type = "llamacpp"
+model = "local-command-model"
+base_url = "http://127.0.0.1:8080/v1"
+```
+
+No API key is needed for this loopback-only server. If authentication is added
+to the server, add its token as `api_key` in the private configuration file.
+If editing the file manually, preserve its `0600` permissions. The
+[llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+exposes the `/v1/models` and `/v1/chat/completions` endpoints that `aishell`
+uses.
 
 ## Shell integration
 
@@ -225,4 +305,4 @@ No environment variable is required for the API key, model, or endpoint.
 Every push to a branch runs the
 [`Development build`](.github/workflows/development-build.yml) workflow on
 Ubuntu 24.04. It checks formatting, runs the test suite, builds the optimized
-Linux x86_64 binary
+Linux x86_64 binary.
