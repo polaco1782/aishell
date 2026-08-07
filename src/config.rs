@@ -241,8 +241,11 @@ pub fn interactive_setup() -> Result<PathBuf> {
         ),
         (None, false) => format!("🔑 {} API key (optional) › ", provider.display_name()),
     };
-    let entered_key =
-        rpassword::prompt_password(key_prompt).context("could not read the API key")?;
+    let password_config = rpassword::ConfigBuilder::new()
+        .password_feedback_mask('*')
+        .build();
+    let entered_key = rpassword::prompt_password_with_config(key_prompt, password_config)
+        .context("could not read the API key")?;
     let api_key = match (entered_key.trim(), existing_provider) {
         ("-", _) if !provider.requires_api_key() => None,
         ("", Some(config)) => config.provider.api_key.clone(),

@@ -1,0 +1,152 @@
+name: Linux build
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        description: Git ref or commit to build
+        required: true
+        type: string
+      build-label:
+        description: Version label stored in the package
+        required: true
+        type: string
+      archive-name:
+        description: Release archive filename
+        required: true
+        type: string
+      artifact-name:
+        description: GitHub Actions artifact name
+        required: true
+        type: string
+      retention-days:
+        description: GitHub Actions artifact retention
+        required: true
+        type: number
+      publish-release:
+        description: Attach the archive to a GitHub Release
+        required: false
+        default: false
+        type: boolean
+      release-tag:
+        description: Existing Git tag used for the GitHub Release
+        required: false
+        default: ""
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        if: inputs.publish-release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must use a version such as v1.2.3 or v1.2.3-rc.1" >&2
+            exit 1
+          fi
+
+          tag_commit=$(git rev-parse "${RELEASE_TAG}^{commit}")
+          checkout_commit=$(git rev-parse HEAD)
+          if [[ "$checkout_commit" != "$tag_commit" ]]; then
+            echo "checked-out commit does not match $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+
+      - name: Show Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build optimized binary
+        run: cargo build --release --locked
+
+      - name: Package Linux x86_64 build
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ inputs.archive-name }}
+          BUILD_LABEL: ${{ inputs.build-label }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$ARCHIVE_NAME" =~ ^aishell-[0-9A-Za-z._-]+-linux-x86_64\.tar\.gz$ ]]; then
+            echo "invalid archive name: $ARCHIVE_NAME" >&2
+            exit 1
+          fi
+
+          package_name=${ARCHIVE_NAME%.tar.gz}
+          package_dir="dist/$package_name"
+
+          mkdir -p "$package_dir"
+          install -m 0755 target/release/ai "$package_dir/ai"
+          install -m 0644 README.md "$package_dir/README.md"
+          git rev-parse HEAD > "$package_dir/COMMIT"
+          printf '%s\n' "$BUILD_LABEL" > "$package_dir/BUILD"
+
+          tar -C dist -czf "dist/$ARCHIVE_NAME" "$package_name"
+          (
+            cd dist
+            sha256sum "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
+          )
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: |
+            dist/${{ inputs.archive-name }}
+            dist/${{ inputs.archive-name }}.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: inputs.publish-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          ARCHIVE_NAME: ${{ inputs.archive-name }}
+        run: |
+          set -euo pipefail
+
+          assets=(
+            "dist/$ARCHIVE_NAME"
+            "dist/$ARCHIVE_NAME.sha256"
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "aishell $RELEASE_TAG"
+          fi

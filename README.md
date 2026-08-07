@@ -299,10 +299,3 @@ Use `ai -- <description>` when a description exactly matches one of the
 management commands shown above.
 
 No environment variable is required for the API key, model, or endpoint.
-
-## Development builds
-
-Every push to a branch runs the
-[`Development build`](.github/workflows/development-build.yml) workflow on
-Ubuntu 24.04. It checks formatting, runs the test suite, builds the optimized
-Linux x86_64 binary.

@@ -1,0 +1,36 @@
+name: Tagged build
+
+run-name: Tagged build ${{ inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, such as v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tagged-build-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    permissions:
+      contents: write
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.sha }}
+      build-label: ${{ inputs.tag || github.ref_name }}
+      archive-name: aishell-${{ inputs.tag || github.ref_name }}-linux-x86_64.tar.gz
+      artifact-name: aishell-${{ inputs.tag || github.ref_name }}-linux-x86_64
+      retention-days: 90
+      publish-release: true
+      release-tag: ${{ inputs.tag || github.ref_name }}
