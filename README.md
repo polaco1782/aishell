@@ -16,7 +16,7 @@ to do multiple interactions with the resulting commands.
 
 ## Demo
 
-![Tab opens the aishell prompt, submits a natural-language request, and replaces it with an editable command](aishell-demo.gif)
+![Tab opens the aishell prompt, submits a natural-language request, displays its color-coded command risk, and leaves the generated command editable](aishell-demo.gif)
 
 Press Tab on an empty command line, describe the operation, and press Tab again.
 The AI request is replaced in place by a command that can be reviewed before
