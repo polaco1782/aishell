@@ -137,8 +137,12 @@ impl DestructiveRisk {
         }
     }
 
-    pub const fn requires_warning(self) -> bool {
-        !matches!(self, Self::Safe)
+    pub const fn message_color(self) -> &'static str {
+        match self {
+            Self::Safe => crate::ui::LIGHT_GREEN,
+            Self::Moderate => crate::ui::LIGHT_YELLOW,
+            Self::High => crate::ui::LIGHT_RED,
+        }
     }
 }
 

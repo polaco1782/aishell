@@ -106,10 +106,10 @@ risk_warning = true
 ```
 
 Every generated command is classified by the model as `safe`, `moderate`, or
-`high` destructive risk. Moderate- and high-risk commands show a warning and a
-five-second countdown before the command becomes available. Set
-`safety.risk_warning = false` to disable the warning and delay; risk
-classification remains part of the model response.
+`high` destructive risk. Generated commands show a color-coded risk message:
+light green for safe, light yellow for moderate, and light red for high. Set
+`safety.risk_warning = false` to disable the message; risk classification
+remains part of the model response.
 
 Useful configuration commands:
 
@@ -248,7 +248,8 @@ The complete generation flow is:
 4. The AI prompt is replaced in place by an animated dot spinner such as
    `⠋ ✨ Crafting command…` while `aishell` asks the configured model for either
    a command, a clarifying question, or an answer.
-5. Moderate- and high-risk commands display a warning and five-second countdown.
+5. A light green, light yellow, or light red message displays the command's
+   safe, moderate, or high destructive-risk classification.
 6. A generated command replaces the AI request in the same editable line. It
    remains unexecuted so it can be inspected or changed.
 7. Press Enter only after reviewing the generated command to execute it through

@@ -11,8 +11,6 @@ mod ui;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -21,8 +19,6 @@ use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
 use crate::provider::{AiClient, DestructiveRisk, GeneratedOutput};
 use crate::system_info::SystemInfo;
-
-const RISK_WARNING_SECONDS: u64 = 5;
 
 fn main() {
     if let Err(error) = run() {
@@ -166,7 +162,7 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
 
     match output {
         GeneratedOutput::Command { command, risk } => {
-            if config.safety.risk_warning && risk.requires_warning() {
+            if config.safety.risk_warning {
                 warn_before_command(risk)?;
             }
             println!("{command}");
@@ -179,39 +175,24 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
 }
 
 fn warn_before_command(risk: DestructiveRisk) -> Result<()> {
-    warn_before_command_with(risk, &mut io::stderr().lock(), thread::sleep)
+    warn_before_command_with(risk, &mut io::stderr().lock())
 }
 
-fn warn_before_command_with(
-    risk: DestructiveRisk,
-    stderr: &mut impl Write,
-    mut sleep: impl FnMut(Duration),
-) -> Result<()> {
+fn warn_before_command_with(risk: DestructiveRisk, stderr: &mut impl Write) -> Result<()> {
     let consequence = match risk {
-        DestructiveRisk::Safe => return Ok(()),
-        DestructiveRisk::Moderate => "may modify your system or data",
-        DestructiveRisk::High => "may cause destructive or difficult-to-reverse changes",
+        DestructiveRisk::Safe => "is unlikely to cause damage, but review it carefully.",
+        DestructiveRisk::Moderate => "may modify your system or data. Review it carefully.",
+        DestructiveRisk::High => "may cause destructive or difficult-to-reverse changes. Review it carefully.",
     };
     writeln!(
         stderr,
-        "{} {} destructive risk · This command {consequence}. Review it carefully.",
+        "{}{}  {} · Command {consequence} {}",
+        risk.message_color(),
         ui::WARNING,
-        risk.as_str()
+        risk.as_str(),
+        ui::RESET_COLOR
     )
-    .context("could not display the command risk warning")?;
-    for seconds in (1..=RISK_WARNING_SECONDS).rev() {
-        writeln!(
-            stderr,
-            "{} Command available in {seconds}s · Press Ctrl-C to cancel.",
-            ui::WARNING
-        )
-        .context("could not display the command risk countdown")?;
-        stderr
-            .flush()
-            .context("could not display the command risk countdown")?;
-        sleep(Duration::from_secs(1));
-    }
-    Ok(())
+    .context("could not display the command risk warning")
 }
 
 fn show_context() -> Result<()> {
@@ -304,40 +285,23 @@ const DEFAULT_SHELL: Shell = Shell::Bash;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::{DestructiveRisk, RISK_WARNING_SECONDS, warn_before_command_with};
+    use super::{DestructiveRisk, warn_before_command_with};
 
     #[test]
-    fn safe_commands_have_no_warning_or_delay() {
-        let mut warning = Vec::new();
-        let mut delays = Vec::new();
-        warn_before_command_with(DestructiveRisk::Safe, &mut warning, |delay| {
-            delays.push(delay);
-        })
-        .unwrap();
-
-        assert!(warning.is_empty());
-        assert!(delays.is_empty());
-    }
-
-    #[test]
-    fn risky_commands_have_a_five_second_cancellable_countdown() {
-        for risk in [DestructiveRisk::Moderate, DestructiveRisk::High] {
+    fn risk_messages_use_their_assigned_light_color_without_a_countdown() {
+        for risk in [
+            DestructiveRisk::Safe,
+            DestructiveRisk::Moderate,
+            DestructiveRisk::High,
+        ] {
             let mut warning = Vec::new();
-            let mut delays = Vec::new();
-            warn_before_command_with(risk, &mut warning, |delay| delays.push(delay)).unwrap();
+            warn_before_command_with(risk, &mut warning).unwrap();
 
             let warning = String::from_utf8(warning).unwrap();
-            assert!(warning.contains(&format!("{} destructive risk", risk.as_str())));
-            for seconds in (1..=RISK_WARNING_SECONDS).rev() {
-                assert!(warning.contains(&format!("Command available in {seconds}s")));
-            }
-            assert_eq!(
-                delays,
-                vec![Duration::from_secs(1); RISK_WARNING_SECONDS as usize]
-            );
-            assert!(warning.contains("Ctrl-C to cancel"));
+            assert!(warning.starts_with(risk.message_color()));
+            assert!(warning.contains(&format!("{}", risk.as_str())));
+            assert!(warning.ends_with("\x1b[0m\n"));
+            assert!(!warning.contains("Command available in"));
         }
     }
 }

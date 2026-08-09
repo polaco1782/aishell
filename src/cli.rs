@@ -174,8 +174,8 @@ Tab behavior after installing the integration:
 
 A generated command replaces the AI request in the same editable line but is
 not executed. Review or edit it, then press Enter to execute it normally.
-Commands classified as moderate or high destructive risk are held behind a
-five-second warning unless `safety.risk_warning` is disabled in the config file.
+Generated commands display a color-coded destructive-risk message unless
+`safety.risk_warning` is disabled in the config file.
 Clarifying questions and general answers are displayed without inserting an
 executable line. The direct `ai [description...]` CLI prints its result because
 only an installed shell integration can replace its parent shell's edit buffer.

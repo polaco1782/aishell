@@ -84,7 +84,7 @@ __aishell_generate() {
     fi
 
     # Keep stdout isolated for the editable command. Stream complete stderr
-    # lines so risk countdowns remain visible while the command is gated.
+    # lines so the risk message remains visible above the generated command.
     # The foreground subshell owns the background request, keeping Bash job
     # notices hidden and ensuring an interrupt also terminates the generator.
     (
