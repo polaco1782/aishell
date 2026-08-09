@@ -64,7 +64,7 @@ __aishell_bind_accept_fallback() {
 
 __aishell_generate() {
     local request=${READLINE_LINE#"$__aishell_prompt_prefix"}
-    local generated output_file error_file error_text
+    local generated output_file error_file
     local -a spinner_frames=( {{SPINNER_FRAMES}} )
     local -i generation_status spinner_index=0
 
@@ -83,25 +83,45 @@ __aishell_generate() {
         return
     fi
 
-    # Do not let child diagnostics invalidate Readline's idea of the current
-    # prompt geometry. Animate in place while stdout and stderr stay isolated.
+    # Keep stdout isolated for the editable command. Stream complete stderr
+    # lines so risk countdowns remain visible while the command is gated.
     # The foreground subshell owns the background request, keeping Bash job
     # notices hidden and ensuring an interrupt also terminates the generator.
     (
-        local generation_pid
+        local generation_pid diagnostic_fd diagnostic_line
+        local -i diagnostics_visible=0
         trap 'kill "$generation_pid" 2>/dev/null; wait "$generation_pid" 2>/dev/null; exit 130' INT TERM HUP
+        exec {diagnostic_fd}<"$error_file"
         command ai --shell bash -- "$request" >"$output_file" 2>"$error_file" &
         generation_pid=$!
         while kill -0 "$generation_pid" 2>/dev/null; do
-            printf '\r\033[2K%s {{THINKING}}' "${spinner_frames[spinner_index]}" >&2
-            (( spinner_index = (spinner_index + 1) % ${#spinner_frames[@]} ))
+            while IFS= read -r diagnostic_line <&"$diagnostic_fd"; do
+                if (( diagnostics_visible == 0 )); then
+                    printf '\r\033[2K' >&2
+                fi
+                printf '%s\n' "$diagnostic_line" >&2
+                diagnostics_visible=1
+            done
+            if (( diagnostics_visible == 0 )); then
+                printf '\r\033[2K%s {{THINKING}}' "${spinner_frames[spinner_index]}" >&2
+                (( spinner_index = (spinner_index + 1) % ${#spinner_frames[@]} ))
+            fi
             command sleep 0.08
         done
         wait "$generation_pid"
+        generation_status=$?
+        while IFS= read -r diagnostic_line <&"$diagnostic_fd"; do
+            if (( diagnostics_visible == 0 )); then
+                printf '\r\033[2K' >&2
+            fi
+            printf '%s\n' "$diagnostic_line" >&2
+            diagnostics_visible=1
+        done
+        exec {diagnostic_fd}<&-
+        exit "$generation_status"
     )
     generation_status=$?
     generated=$(<"$output_file")
-    error_text=$(<"$error_file")
     command rm -f -- "$output_file" "$error_file"
     printf '\r\033[2K' >&2
 
@@ -114,14 +134,7 @@ __aishell_generate() {
             READLINE_POINT=0
         fi
     else
-        if [[ -n $error_text ]]; then
-            printf '%s\n' "$error_text" >&2
-        fi
         printf '{{ERROR}} Generation failed; request kept for editing\n' >&2
-    fi
-
-    if (( generation_status == 0 )) && [[ -n $error_text ]]; then
-        printf '%s\n' "$error_text" >&2
     fi
 }
 
@@ -189,11 +202,11 @@ __aishell_tab() {
     # Background generation is private widget work, not a user-visible job.
     unsetopt MONITOR NOTIFY
     setopt LOCAL_TRAPS
-    local generated request output_file error_file error_text status_message generation_pid
+    local generated request output_file error_file generation_pid diagnostic_fd diagnostic_line
     local original_prompt=$PROMPT
     local original_rprompt=$RPROMPT
     local -a spinner_frames=( {{SPINNER_FRAMES}} )
-    local -i generation_status spinner_index=1
+    local -i generation_status spinner_index=1 diagnostics_visible=0
 
     # During the recursive prompt, Tab must not recursively open another one.
     if (( __aishell_prompt_active )); then
@@ -258,20 +271,41 @@ __aishell_tab() {
         return
     fi
 
+    exec {diagnostic_fd}<"$error_file"
     command ai --shell zsh -- "$request" >"$output_file" 2>"$error_file" &
     generation_pid=$!
     trap 'kill "$generation_pid" 2>/dev/null' INT TERM HUP
     while kill -0 "$generation_pid" 2>/dev/null; do
-        BUFFER="${spinner_frames[spinner_index]} {{THINKING}}"
-        CURSOR=${#BUFFER}
-        zle -R
-        (( spinner_index = spinner_index % ${#spinner_frames} + 1 ))
+        while IFS= read -r diagnostic_line <&"$diagnostic_fd"; do
+            if (( diagnostics_visible == 0 )); then
+                BUFFER=
+                CURSOR=0
+                zle -R
+            fi
+            printf '%s\n' "$diagnostic_line" >&2
+            diagnostics_visible=1
+        done
+        if (( diagnostics_visible == 0 )); then
+            BUFFER="${spinner_frames[spinner_index]} {{THINKING}}"
+            CURSOR=${#BUFFER}
+            zle -R
+            (( spinner_index = spinner_index % ${#spinner_frames} + 1 ))
+        fi
         command sleep 0.08
     done
     wait "$generation_pid"
     generation_status=$?
+    while IFS= read -r diagnostic_line <&"$diagnostic_fd"; do
+        if (( diagnostics_visible == 0 )); then
+            BUFFER=
+            CURSOR=0
+            zle -R
+        fi
+        printf '%s\n' "$diagnostic_line" >&2
+        diagnostics_visible=1
+    done
+    exec {diagnostic_fd}<&-
     generated=$(<"$output_file")
-    error_text=$(<"$error_file")
     command rm -f -- "$output_file" "$error_file"
 
     BUFFER=
@@ -281,15 +315,12 @@ __aishell_tab() {
             BUFFER=$generated
             CURSOR=${#BUFFER}
         fi
-        status_message=$error_text
-    else
-        status_message=${error_text:+$error_text$'\n'}'{{ERROR}} Generation failed'
     fi
     PROMPT=$original_prompt
     RPROMPT=$original_rprompt
     zle reset-prompt
-    if [[ -n $status_message ]]; then
-        zle -M "$status_message"
+    if (( generation_status != 0 )); then
+        zle -M '{{ERROR}} Generation failed'
     fi
 }
 
@@ -347,6 +378,7 @@ function global:Invoke-AishellGeneration {
     $started = $false
     $generated = ''
     $diagnostics = ''
+    $diagnosticsVisible = $false
     [int]$generationStatus = 1
 
     try {
@@ -376,7 +408,7 @@ function global:Invoke-AishellGeneration {
         }
         $started = $true
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stderrLineTask = $process.StandardError.ReadLineAsync()
         $requestBytes = $utf8.GetBytes($request)
         $process.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length)
         $process.StandardInput.BaseStream.Flush()
@@ -384,14 +416,41 @@ function global:Invoke-AishellGeneration {
 
         [int]$spinnerIndex = 0
         do {
-            Set-AishellBuffer ("{0} {{THINKING}}" -f $global:__AishellSpinnerFrames[$spinnerIndex])
-            $spinnerIndex = ($spinnerIndex + 1) % $global:__AishellSpinnerFrames.Count
+            while ($stderrLineTask.IsCompleted) {
+                $diagnosticLine = $stderrLineTask.Result
+                if ($null -eq $diagnosticLine) {
+                    break
+                }
+                if (-not $diagnosticsVisible) {
+                    Set-AishellBuffer
+                    [Console]::Error.WriteLine()
+                }
+                [Console]::Error.WriteLine($diagnosticLine)
+                $diagnosticsVisible = $true
+                $stderrLineTask = $process.StandardError.ReadLineAsync()
+            }
+            if (-not $diagnosticsVisible) {
+                Set-AishellBuffer ("{0} {{THINKING}}" -f $global:__AishellSpinnerFrames[$spinnerIndex])
+                $spinnerIndex = ($spinnerIndex + 1) % $global:__AishellSpinnerFrames.Count
+            }
             $finished = $process.WaitForExit(80)
         } while (-not $finished)
 
         $process.WaitForExit()
+        while ($null -ne $stderrLineTask) {
+            $diagnosticLine = $stderrLineTask.Result
+            if ($null -eq $diagnosticLine) {
+                break
+            }
+            if (-not $diagnosticsVisible) {
+                Set-AishellBuffer
+                [Console]::Error.WriteLine()
+            }
+            [Console]::Error.WriteLine($diagnosticLine)
+            $diagnosticsVisible = $true
+            $stderrLineTask = $process.StandardError.ReadLineAsync()
+        }
         $generated = $stdoutTask.Result.TrimEnd([char[]]@("`r", "`n"))
-        $diagnostics = $stderrTask.Result.TrimEnd([char[]]@("`r", "`n"))
         $generationStatus = $process.ExitCode
     }
     catch {
@@ -419,10 +478,16 @@ function global:Invoke-AishellGeneration {
     }
     else {
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert($Line)
-        if (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
-            $diagnostics += "`n"
+        if ($diagnosticsVisible) {
+            $diagnostics = '{{ERROR}} Generation failed; request kept for editing'
         }
-        $diagnostics += '{{ERROR}} Generation failed; request kept for editing'
+        elseif (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
+            $diagnostics += "`n"
+            $diagnostics += '{{ERROR}} Generation failed; request kept for editing'
+        }
+        else {
+            $diagnostics = '{{ERROR}} Generation failed; request kept for editing'
+        }
     }
     Write-AishellDiagnostics $diagnostics
 }
@@ -500,6 +565,8 @@ mod tests {
         assert!(script.contains("✨ Crafting command…"));
         assert!(script.contains("spinner_frames=( ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏ )"));
         assert!(script.contains("command sleep 0.08"));
+        assert!(script.contains("exec {diagnostic_fd}<\"$error_file\""));
+        assert!(script.contains("read -r diagnostic_line <&\"$diagnostic_fd\""));
         assert!(script.contains("aishell.bash.output.XXXXXXXX"));
         assert!(script.contains("aishell.bash.error.XXXXXXXX"));
         assert!(!script.contains("{{"));
@@ -525,6 +592,8 @@ mod tests {
             script.contains("BUFFER=\"${spinner_frames[spinner_index]} ✨ Crafting command…\"")
         );
         assert!(script.contains("command sleep 0.08"));
+        assert!(script.contains("exec {diagnostic_fd}<\"$error_file\""));
+        assert!(script.contains("read -r diagnostic_line <&\"$diagnostic_fd\""));
         assert!(script.contains("unsetopt MONITOR NOTIFY"));
         assert!(script.contains("aishell.zsh.output.XXXXXXXX"));
         assert!(script.contains("aishell.zsh.error.XXXXXXXX"));
@@ -550,6 +619,8 @@ mod tests {
         assert!(script.contains("RedirectStandardInput = $true"));
         assert!(script.contains("$process.StandardInput.BaseStream.Write($requestBytes"));
         assert!(script.contains("$process.WaitForExit(80)"));
+        assert!(script.contains("$process.StandardError.ReadLineAsync()"));
+        assert!(script.contains("[Console]::Error.WriteLine($diagnosticLine)"));
         assert!(script.contains("::Insert($generated)"));
         assert!(!script.contains("Invoke-Expression"));
         assert!(!script.contains(

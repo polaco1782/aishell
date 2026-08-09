@@ -82,9 +82,9 @@ written to `%LOCALAPPDATA%\aishell\config.toml`, under the current user's
 profile and inherited access controls. The data directory and private files
 reject symlink and Windows reparse-point replacements.
 
-The provider configuration schema is intentionally current-only. After updating
-from an OpenRouter-only version, run `ai setup` to replace the old configuration.
-An OpenAI example is:
+The configuration schema is intentionally current-only. After updating from a
+version without the `[provider]` or `[safety]` section, run `ai setup` to replace
+the old configuration. An OpenAI example is:
 
 ```toml
 [provider]
@@ -100,7 +100,16 @@ max_output_tokens = 256
 [context]
 enabled = true
 max_turns = 6
+
+[safety]
+risk_warning = true
 ```
+
+Every generated command is classified by the model as `safe`, `moderate`, or
+`high` destructive risk. Moderate- and high-risk commands show a warning and a
+five-second countdown before the command becomes available. Set
+`safety.risk_warning = false` to disable the warning and delay; risk
+classification remains part of the model response.
 
 Useful configuration commands:
 
@@ -239,9 +248,10 @@ The complete generation flow is:
 4. The AI prompt is replaced in place by an animated dot spinner such as
    `⠋ ✨ Crafting command…` while `aishell` asks the configured model for either
    a command, a clarifying question, or an answer.
-5. A generated command replaces the AI request in the same editable line. It
+5. Moderate- and high-risk commands display a warning and five-second countdown.
+6. A generated command replaces the AI request in the same editable line. It
    remains unexecuted so it can be inspected or changed.
-6. Press Enter only after reviewing the generated command to execute it through
+7. Press Enter only after reviewing the generated command to execute it through
    the shell normally.
 
 The visible line changes in place. The arrows below represent successive

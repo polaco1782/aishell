@@ -23,6 +23,7 @@ pub struct Config {
     pub generation: GenerationConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    pub safety: SafetyConfig,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -52,6 +53,18 @@ pub struct ContextConfig {
     pub enabled: bool,
     #[serde(default = "default_context_max_turns")]
     pub max_turns: usize,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafetyConfig {
+    pub risk_warning: bool,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self { risk_warning: true }
+    }
 }
 
 impl Default for GenerationConfig {
@@ -162,14 +175,15 @@ impl Config {
             .map(|_| "api_key = \"<redacted>\"\n")
             .unwrap_or_default();
         format!(
-            "[provider]\ntype = {:?}\n{api_key}model = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n",
+            "[provider]\ntype = {:?}\n{api_key}model = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n\n[safety]\nrisk_warning = {}\n",
             self.provider.kind.as_str(),
             self.provider.model,
             self.provider.base_url,
             self.generation.timeout_seconds,
             self.generation.max_output_tokens,
             self.context.enabled,
-            self.context.max_turns
+            self.context.max_turns,
+            self.safety.risk_warning
         )
     }
 
@@ -277,6 +291,10 @@ pub fn interactive_setup() -> Result<PathBuf> {
         .as_ref()
         .map(|config| config.context.clone())
         .unwrap_or_default();
+    let safety = existing
+        .as_ref()
+        .map(|config| config.safety.clone())
+        .unwrap_or_default();
     let config = Config {
         provider: ProviderConfig {
             kind: provider,
@@ -286,6 +304,7 @@ pub fn interactive_setup() -> Result<PathBuf> {
         },
         generation,
         context,
+        safety,
     };
     config.save_to(&path)?;
     Ok(path)
@@ -338,7 +357,7 @@ mod tests {
 
     use std::str::FromStr;
 
-    use super::{Config, ContextConfig, GenerationConfig, Provider, ProviderConfig};
+    use super::{Config, ContextConfig, GenerationConfig, Provider, ProviderConfig, SafetyConfig};
 
     fn config() -> Config {
         Config {
@@ -350,6 +369,7 @@ mod tests {
             },
             generation: GenerationConfig::default(),
             context: ContextConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 
@@ -387,6 +407,21 @@ mod tests {
     }
 
     #[test]
+    fn safety_warning_can_be_disabled() {
+        let mut config = config();
+        config.safety.risk_warning = false;
+
+        let serialized = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(!parsed.safety.risk_warning);
+        assert!(
+            config
+                .redacted_toml()
+                .contains("[safety]\nrisk_warning = false")
+        );
+    }
+
+    #[test]
     fn provider_configuration_gets_default_generation_and_context_settings() {
         let parsed: Config = toml::from_str(
             r#"[provider]
@@ -394,12 +429,29 @@ type = "openai"
 api_key = "secret-value"
 model = "gpt-5.6-luna"
 base_url = "https://api.openai.com/v1"
+
+[safety]
+risk_warning = true
 "#,
         )
         .unwrap();
 
         assert!(parsed.context.enabled);
         assert_eq!(parsed.context.max_turns, 6);
+    }
+
+    #[test]
+    fn requires_the_current_safety_configuration() {
+        let parsed = toml::from_str::<Config>(
+            r#"[provider]
+type = "openai"
+api_key = "secret-value"
+model = "gpt-5.6-luna"
+base_url = "https://api.openai.com/v1"
+"#,
+        );
+
+        assert!(parsed.is_err());
     }
 
     #[test]

@@ -11,14 +11,18 @@ mod ui;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{Action, PromptSource, Shell};
 use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
-use crate::provider::{AiClient, GeneratedOutput};
+use crate::provider::{AiClient, DestructiveRisk, GeneratedOutput};
 use crate::system_info::SystemInfo;
+
+const RISK_WARNING_SECONDS: u64 = 5;
 
 fn main() {
     if let Err(error) = run() {
@@ -149,7 +153,7 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
 
     if let Some(store) = context.as_mut() {
         let response = match &output {
-            GeneratedOutput::Command(command) => ContextResponse::Command(command.clone()),
+            GeneratedOutput::Command { command, .. } => ContextResponse::Command(command.clone()),
             GeneratedOutput::Clarification(question) => {
                 ContextResponse::Clarification(question.clone())
             }
@@ -161,10 +165,51 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
     }
 
     match output {
-        GeneratedOutput::Command(command) => println!("{command}"),
+        GeneratedOutput::Command { command, risk } => {
+            if config.safety.risk_warning && risk.requires_warning() {
+                warn_before_command(risk)?;
+            }
+            println!("{command}");
+        }
         // Non-command responses stay off stdout so shell widgets never insert them.
         GeneratedOutput::Clarification(question) => eprintln!("{} {question}", ui::AI),
         GeneratedOutput::Answer(answer) => eprintln!("{} {answer}", ui::AI),
+    }
+    Ok(())
+}
+
+fn warn_before_command(risk: DestructiveRisk) -> Result<()> {
+    warn_before_command_with(risk, &mut io::stderr().lock(), thread::sleep)
+}
+
+fn warn_before_command_with(
+    risk: DestructiveRisk,
+    stderr: &mut impl Write,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    let consequence = match risk {
+        DestructiveRisk::Safe => return Ok(()),
+        DestructiveRisk::Moderate => "may modify your system or data",
+        DestructiveRisk::High => "may cause destructive or difficult-to-reverse changes",
+    };
+    writeln!(
+        stderr,
+        "{} {} destructive risk · This command {consequence}. Review it carefully.",
+        ui::WARNING,
+        risk.as_str()
+    )
+    .context("could not display the command risk warning")?;
+    for seconds in (1..=RISK_WARNING_SECONDS).rev() {
+        writeln!(
+            stderr,
+            "{} Command available in {seconds}s · Press Ctrl-C to cancel.",
+            ui::WARNING
+        )
+        .context("could not display the command risk countdown")?;
+        stderr
+            .flush()
+            .context("could not display the command risk countdown")?;
+        sleep(Duration::from_secs(1));
     }
     Ok(())
 }
@@ -256,3 +301,43 @@ const DEFAULT_SHELL: Shell = Shell::Pwsh;
 
 #[cfg(not(windows))]
 const DEFAULT_SHELL: Shell = Shell::Bash;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{DestructiveRisk, RISK_WARNING_SECONDS, warn_before_command_with};
+
+    #[test]
+    fn safe_commands_have_no_warning_or_delay() {
+        let mut warning = Vec::new();
+        let mut delays = Vec::new();
+        warn_before_command_with(DestructiveRisk::Safe, &mut warning, |delay| {
+            delays.push(delay);
+        })
+        .unwrap();
+
+        assert!(warning.is_empty());
+        assert!(delays.is_empty());
+    }
+
+    #[test]
+    fn risky_commands_have_a_five_second_cancellable_countdown() {
+        for risk in [DestructiveRisk::Moderate, DestructiveRisk::High] {
+            let mut warning = Vec::new();
+            let mut delays = Vec::new();
+            warn_before_command_with(risk, &mut warning, |delay| delays.push(delay)).unwrap();
+
+            let warning = String::from_utf8(warning).unwrap();
+            assert!(warning.contains(&format!("{} destructive risk", risk.as_str())));
+            for seconds in (1..=RISK_WARNING_SECONDS).rev() {
+                assert!(warning.contains(&format!("Command available in {seconds}s")));
+            }
+            assert_eq!(
+                delays,
+                vec![Duration::from_secs(1); RISK_WARNING_SECONDS as usize]
+            );
+            assert!(warning.contains("Ctrl-C to cancel"));
+        }
+    }
+}
