@@ -129,14 +129,6 @@ pub enum DestructiveRisk {
 }
 
 impl DestructiveRisk {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Safe => "safe",
-            Self::Moderate => "moderate",
-            Self::High => "high",
-        }
-    }
-
     pub const fn message_color(self) -> &'static str {
         match self {
             Self::Safe => crate::ui::LIGHT_GREEN,

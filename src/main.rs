@@ -186,10 +186,9 @@ fn warn_before_command_with(risk: DestructiveRisk, stderr: &mut impl Write) -> R
     };
     writeln!(
         stderr,
-        "{}{}  {} · Command {consequence} {}",
+        "{}{}  · Command {consequence} {}",
         risk.message_color(),
         ui::WARNING,
-        risk.as_str(),
         ui::RESET_COLOR
     )
     .context("could not display the command risk warning")
@@ -299,7 +298,6 @@ mod tests {
 
             let warning = String::from_utf8(warning).unwrap();
             assert!(warning.starts_with(risk.message_color()));
-            assert!(warning.contains(&format!("{}", risk.as_str())));
             assert!(warning.ends_with("\x1b[0m\n"));
             assert!(!warning.contains("Command available in"));
         }
