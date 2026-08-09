@@ -21,3 +21,15 @@ jobs:
       archive-name: aishell-development-linux-x86_64.tar.gz
       artifact-name: aishell-development-linux-x86_64-${{ github.sha }}
       retention-days: 14
+
+  build-windows-x86_64:
+    name: Windows x86_64
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      build-label: development
+      archive-name: aishell-development-windows-x86_64.zip
+      artifact-name: aishell-development-windows-x86_64-${{ github.sha }}
+      retention-days: 14

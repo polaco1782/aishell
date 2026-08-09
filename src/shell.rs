@@ -1,18 +1,30 @@
+use anyhow::{Result, bail};
+
 use crate::cli::Shell;
 use crate::ui;
 
-pub fn init_script(shell: Shell) -> String {
+pub fn init_script(shell: Shell) -> Result<String> {
     let template = match shell {
         Shell::Bash => BASH_INIT,
         Shell::Zsh => ZSH_INIT,
+        Shell::Pwsh => POWERSHELL_INIT,
+        Shell::Cmd => bail!("cmd.exe does not support programmable edit-buffer integration"),
     };
 
     // Keep terminal-facing labels consistent with the standalone CLI.
-    template
+    Ok(template
         .replace("{{AI_PROMPT}}", ui::AI_PROMPT)
         .replace("{{THINKING}}", ui::THINKING)
         .replace("{{SPINNER_FRAMES}}", ui::SPINNER_FRAMES)
-        .replace("{{ERROR}}", ui::ERROR)
+        .replace(
+            "{{POWERSHELL_SPINNER_FRAMES}}",
+            &ui::SPINNER_FRAMES
+                .split_whitespace()
+                .map(|frame| format!("'{frame}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .replace("{{ERROR}}", ui::ERROR))
 }
 
 // Bash cannot invoke its normal completion or accept-line widgets from a
@@ -291,13 +303,193 @@ done
 unset __aishell_keymap
 "#;
 
+const POWERSHELL_INIT: &str = r#"# Keep related requests in one private conversation without writing into the
+# working directory. A newly started PowerShell process receives a new ID.
+if ($env:AISHELL_SESSION_OWNER_PID -ne [string]$PID) {
+    $env:AISHELL_SESSION_OWNER_PID = [string]$PID
+    $env:AISHELL_SESSION_ID = "powershell-$PID-$([Guid]::NewGuid().ToString('N'))"
+}
+
+Import-Module PSReadLine -MinimumVersion 2.0 -ErrorAction Stop
+
+$global:__AishellPromptPrefix = '# {{AI_PROMPT}}'
+$global:__AishellSpinnerFrames = @({{POWERSHELL_SPINNER_FRAMES}})
+
+function global:Set-AishellBuffer {
+    param([string]$Text = '')
+
+    $line = $null
+    [int]$cursor = 0
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $Text)
+}
+
+function global:Write-AishellDiagnostics {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return
+    }
+    [Console]::Error.WriteLine()
+    [Console]::Error.WriteLine($Message.TrimEnd([char[]]@("`r", "`n")))
+    [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+}
+
+function global:Invoke-AishellGeneration {
+    param([string]$Line)
+
+    $request = $Line.Substring($global:__AishellPromptPrefix.Length)
+    if ([string]::IsNullOrWhiteSpace($request)) {
+        return
+    }
+
+    $process = $null
+    $started = $false
+    $generated = ''
+    $diagnostics = ''
+    [int]$generationStatus = 1
+
+    try {
+        $aiCommand = Get-Command ai -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $location = Get-Location
+        if ($location.Provider.Name -ne 'FileSystem') {
+            throw 'aishell requires a filesystem working directory'
+        }
+
+        $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $aiCommand.Path
+        $startInfo.Arguments = '--shell powershell --stdin'
+        $startInfo.WorkingDirectory = $location.ProviderPath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.StandardOutputEncoding = $utf8
+        $startInfo.StandardErrorEncoding = $utf8
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'could not start ai.exe'
+        }
+        $started = $true
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $requestBytes = $utf8.GetBytes($request)
+        $process.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length)
+        $process.StandardInput.BaseStream.Flush()
+        $process.StandardInput.Close()
+
+        [int]$spinnerIndex = 0
+        do {
+            Set-AishellBuffer ("{0} {{THINKING}}" -f $global:__AishellSpinnerFrames[$spinnerIndex])
+            $spinnerIndex = ($spinnerIndex + 1) % $global:__AishellSpinnerFrames.Count
+            $finished = $process.WaitForExit(80)
+        } while (-not $finished)
+
+        $process.WaitForExit()
+        $generated = $stdoutTask.Result.TrimEnd([char[]]@("`r", "`n"))
+        $diagnostics = $stderrTask.Result.TrimEnd([char[]]@("`r", "`n"))
+        $generationStatus = $process.ExitCode
+    }
+    catch {
+        $diagnostics = $_.Exception.Message
+    }
+    finally {
+        if ($started -and -not $process.HasExited) {
+            try {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+            catch {
+            }
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+
+    [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+    if ($generationStatus -eq 0) {
+        if (-not [string]::IsNullOrEmpty($generated)) {
+            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($generated)
+        }
+    }
+    else {
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($Line)
+        if (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
+            $diagnostics += "`n"
+        }
+        $diagnostics += '{{ERROR}} Generation failed; request kept for editing'
+    }
+    Write-AishellDiagnostics $diagnostics
+}
+
+$global:__AishellTabHandler = {
+    param($key, $arg)
+
+    $line = $null
+    [int]$cursor = 0
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    if ($line.StartsWith($global:__AishellPromptPrefix, [StringComparison]::Ordinal)) {
+        Invoke-AishellGeneration $line
+        return
+    }
+    if ($line.Length -ne 0) {
+        if ((Get-PSReadLineOption).EditMode -eq 'Vi') {
+            [Microsoft.PowerShell.PSConsoleReadLine]::ViTabCompleteNext()
+        }
+        else {
+            [Microsoft.PowerShell.PSConsoleReadLine]::TabCompleteNext()
+        }
+        return
+    }
+    [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__AishellPromptPrefix)
+}
+
+$global:__AishellEnterHandler = {
+    param($key, $arg)
+
+    $line = $null
+    [int]$cursor = 0
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    if ($line.StartsWith($global:__AishellPromptPrefix, [StringComparison]::Ordinal)) {
+        Invoke-AishellGeneration $line
+    }
+    else {
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    }
+}
+
+$editMode = (Get-PSReadLineOption).EditMode
+if ($editMode -eq 'Vi') {
+    Set-PSReadLineKeyHandler -Chord Tab -ViMode Insert -BriefDescription Aishell `
+        -Description 'Open or submit the aishell prompt, otherwise complete input' `
+        -ScriptBlock $global:__AishellTabHandler
+    Set-PSReadLineKeyHandler -Chord Enter -ViMode Insert -BriefDescription AishellAccept `
+        -Description 'Submit the aishell prompt, otherwise accept input' `
+        -ScriptBlock $global:__AishellEnterHandler
+}
+else {
+    Set-PSReadLineKeyHandler -Chord Tab -BriefDescription Aishell `
+        -Description 'Open or submit the aishell prompt, otherwise complete input' `
+        -ScriptBlock $global:__AishellTabHandler
+    Set-PSReadLineKeyHandler -Chord Enter -BriefDescription AishellAccept `
+        -Description 'Submit the aishell prompt, otherwise accept input' `
+        -ScriptBlock $global:__AishellEnterHandler
+}
+Remove-Variable editMode
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::{Shell, init_script};
 
     #[test]
     fn bash_uses_ai_only_for_an_empty_buffer() {
-        let script = init_script(Shell::Bash);
+        let script = init_script(Shell::Bash).unwrap();
         assert!(script.contains("__aishell_prompt_prefix='# 🤖 AI Prompt › '"));
         assert!(script.contains("if [[ -n $line ]]"));
         assert!(script.contains("__aishell_bind_tab_fallback complete"));
@@ -318,7 +510,7 @@ mod tests {
 
     #[test]
     fn zsh_uses_ai_only_for_an_empty_buffer() {
-        let script = init_script(Shell::Zsh);
+        let script = init_script(Shell::Zsh).unwrap();
         assert!(script.contains("if [[ -n $BUFFER ]]"));
         assert!(script.contains("zle expand-or-complete"));
         assert!(script.contains("PROMPT='🤖 AI Prompt › '"));
@@ -342,5 +534,34 @@ mod tests {
         assert!(!script.contains("zle -R '✨ Crafting command…'"));
         assert!(!script.contains("\n    POSTDISPLAY="));
         assert!(!script.contains("{{"));
+    }
+
+    #[test]
+    fn powershell_uses_psreadline_without_executing_generated_commands() {
+        let script = init_script(Shell::Pwsh).unwrap();
+        assert!(script.contains("Import-Module PSReadLine -MinimumVersion 2.0"));
+        assert!(script.contains("$global:__AishellPromptPrefix = '# 🤖 AI Prompt › '"));
+        assert!(script.contains("GetBufferState([ref]$line, [ref]$cursor)"));
+        assert!(script.contains("::Replace(0, $line.Length, $Text)"));
+        assert!(script.contains("::TabCompleteNext()"));
+        assert!(script.contains("::ViTabCompleteNext()"));
+        assert!(script.contains("::AcceptLine()"));
+        assert!(script.contains("--shell powershell --stdin"));
+        assert!(script.contains("RedirectStandardInput = $true"));
+        assert!(script.contains("$process.StandardInput.BaseStream.Write($requestBytes"));
+        assert!(script.contains("$process.WaitForExit(80)"));
+        assert!(script.contains("::Insert($generated)"));
+        assert!(!script.contains("Invoke-Expression"));
+        assert!(!script.contains(
+            "::AcceptLine()\n        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($generated)"
+        ));
+        assert!(script.contains("'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'"));
+        assert!(script.contains("AISHELL_SESSION_ID = \"powershell-$PID-"));
+        assert!(!script.contains("{{"));
+    }
+
+    #[test]
+    fn cmd_has_no_native_init_script() {
+        assert!(init_script(Shell::Cmd).is_err());
     }
 }

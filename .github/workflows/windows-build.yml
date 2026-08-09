@@ -1,0 +1,189 @@
+name: Windows build
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        description: Git ref or commit to build
+        required: true
+        type: string
+      build-label:
+        description: Version label stored in the package
+        required: true
+        type: string
+      archive-name:
+        description: Release archive filename
+        required: true
+        type: string
+      artifact-name:
+        description: GitHub Actions artifact name
+        required: true
+        type: string
+      retention-days:
+        description: GitHub Actions artifact retention
+        required: true
+        type: number
+      publish-release:
+        description: Attach the archive to a GitHub Release
+        required: false
+        default: false
+        type: boolean
+      release-tag:
+        description: Existing Git tag used for the GitHub Release
+        required: false
+        default: ""
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  build-windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        if: inputs.publish-release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$') {
+              throw "release tag must use a version such as v1.2.3 or v1.2.3-rc.1"
+          }
+
+          $tagCommit = (git rev-parse "$env:RELEASE_TAG^{commit}").Trim()
+          $checkoutCommit = (git rev-parse HEAD).Trim()
+          if ($checkoutCommit -ne $tagCommit) {
+              throw "checked-out commit does not match $env:RELEASE_TAG"
+          }
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
+
+      - name: Show Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build optimized binary
+        run: cargo build --release --locked
+
+      - name: Validate Windows shell contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = (Resolve-Path 'target/release/ai.exe').Path
+
+          $script = & $binary init powershell | Out-String
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseInput(
+              $script,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors.Count -ne 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              throw 'generated PowerShell integration has syntax errors'
+          }
+
+          $configPath = (& $binary config path).Trim()
+          $expectedConfigPath = Join-Path $env:LOCALAPPDATA 'aishell\config.toml'
+          if ($configPath -ne $expectedConfigPath) {
+              throw "unexpected Windows configuration path: $configPath"
+          }
+
+          $contextPath = (& $binary context path).Trim()
+          $expectedContextPath = Join-Path $env:LOCALAPPDATA 'aishell\history.sqlite3'
+          if ($contextPath -ne $expectedContextPath) {
+              throw "unexpected Windows context path: $contextPath"
+          }
+
+      - name: Package Windows x86_64 build
+        shell: pwsh
+        env:
+          ARCHIVE_NAME: ${{ inputs.archive-name }}
+          BUILD_LABEL: ${{ inputs.build-label }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:ARCHIVE_NAME -notmatch '^aishell-[0-9A-Za-z._-]+-windows-x86_64\.zip$') {
+              throw "invalid archive name: $env:ARCHIVE_NAME"
+          }
+
+          $packageName = $env:ARCHIVE_NAME.Substring(0, $env:ARCHIVE_NAME.Length - 4)
+          $packageDirectory = Join-Path 'dist' $packageName
+          $archivePath = Join-Path 'dist' $env:ARCHIVE_NAME
+
+          New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
+          Copy-Item 'target/release/ai.exe' (Join-Path $packageDirectory 'ai.exe')
+          Copy-Item 'README.md' (Join-Path $packageDirectory 'README.md')
+          (git rev-parse HEAD).Trim() | Set-Content (Join-Path $packageDirectory 'COMMIT') -Encoding ascii
+          $env:BUILD_LABEL | Set-Content (Join-Path $packageDirectory 'BUILD') -Encoding utf8NoBOM
+
+          Compress-Archive -Path $packageDirectory -DestinationPath $archivePath
+          $hash = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ARCHIVE_NAME" |
+              Set-Content "$archivePath.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: |
+            dist/${{ inputs.archive-name }}
+            dist/${{ inputs.archive-name }}.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: inputs.publish-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          ARCHIVE_NAME: ${{ inputs.archive-name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+              $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $assets = @(
+              "dist/$env:ARCHIVE_NAME",
+              "dist/$env:ARCHIVE_NAME.sha256"
+          )
+
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $env:RELEASE_TAG @assets --clobber
+          }
+          else {
+              gh release create $env:RELEASE_TAG @assets `
+                  --verify-tag `
+                  --generate-notes `
+                  --title "aishell $env:RELEASE_TAG"
+          }
+          if ($LASTEXITCODE -ne 0) {
+              throw 'could not publish Windows release artifacts'
+          }

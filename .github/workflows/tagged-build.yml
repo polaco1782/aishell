@@ -34,3 +34,18 @@ jobs:
       retention-days: 90
       publish-release: true
       release-tag: ${{ inputs.tag || github.ref_name }}
+
+  build-windows-x86_64:
+    name: Windows x86_64
+    needs: build-linux-x86_64
+    permissions:
+      contents: write
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.sha }}
+      build-label: ${{ inputs.tag || github.ref_name }}
+      archive-name: aishell-${{ inputs.tag || github.ref_name }}-windows-x86_64.zip
+      artifact-name: aishell-${{ inputs.tag || github.ref_name }}-windows-x86_64
+      retention-days: 90
+      publish-release: true
+      release-tag: ${{ inputs.tag || github.ref_name }}

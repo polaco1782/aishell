@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::paths;
 use crate::secure_fs::{create_private_file, verify_private_file};
 
 const DATABASE_FILE_NAME: &str = "history.sqlite3";
@@ -121,16 +122,7 @@ impl ContextStore {
     }
 
     pub fn path() -> Result<PathBuf> {
-        let base = match env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-            Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
-            _ => {
-                let home = env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .context("HOME is not set, so the state path cannot be determined")?;
-                PathBuf::from(home).join(".local").join("state")
-            }
-        };
-        Ok(base.join("aishell").join(DATABASE_FILE_NAME))
+        paths::context_database_file(DATABASE_FILE_NAME)
     }
 
     pub fn working_directory(&self) -> &str {
@@ -306,6 +298,7 @@ mod tests {
     #[test]
     fn session_ids_cannot_escape_the_database_scope() {
         assert!(valid_session_id("bash-123-456"));
+        assert!(valid_session_id("powershell-123-acde"));
         assert!(!valid_session_id("../../another-context"));
         assert!(!valid_session_id("contains spaces"));
     }

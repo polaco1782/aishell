@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if metadata.file_type().is_symlink()
+                || unsupported_reparse_point(&metadata)
+                || !metadata.is_dir()
+            {
                 bail!("{} is not a private directory", path.display());
             }
         }
@@ -27,9 +30,9 @@ pub fn ensure_private_directory(path: &Path) -> Result<()> {
 pub fn verify_private_file(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("could not inspect {description} at {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() || unsupported_reparse_point(&metadata) {
         bail!(
-            "refusing to read {description} through the symlink {}",
+            "refusing to read {description} through a link or reparse point at {}",
             path.display()
         );
     }
@@ -89,11 +92,9 @@ pub fn atomic_write_private(path: &Path, contents: &[u8], description: &str) -> 
         temporary
             .sync_all()
             .context("could not flush temporary file")?;
-        fs::rename(&temporary_path, path)
+        replace_file(&temporary_path, path)
             .with_context(|| format!("could not replace {description} at {}", path.display()))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("could not flush {}", parent.display()))?;
+        sync_directory(parent)?;
         Ok(())
     })();
 
@@ -101,6 +102,74 @@ pub fn atomic_write_private(path: &Path, contents: &[u8], description: &str) -> 
         let _ = fs::remove_file(&temporary_path);
     }
     write_result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a null character",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    // Both paths are resolved and owned by this function for the duration of the call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("could not flush {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unsupported_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn unsupported_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]

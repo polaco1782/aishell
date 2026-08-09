@@ -386,10 +386,11 @@ an editable shell buffer: they may have been changed or never executed, so never
 effects occurred. Host system metadata in the current request is factual local context. For \
 platform-dependent commands, use it to select commands and packages compatible with the reported \
 operating system, distribution family, and version. Do not assume a different distribution or \
-package manager unless the user requests one. A new command will also be shown for review and must \
+package manager unless the user requests one. {} A new command will also be shown for review and must \
 not be described as already executed.",
         shell.as_str(),
-        shell.as_str()
+        shell.as_str(),
+        shell.generation_guidance()
     )
 }
 
@@ -689,6 +690,26 @@ mod tests {
         assert!(messages[0].content.contains("ANSWER:"));
         assert!(messages[0].content.contains("what can you do?"));
         assert!(messages[0].content.contains("distribution family"));
+    }
+
+    #[test]
+    fn gives_windows_shells_distinct_syntax_contracts() {
+        let system_info = SystemInfo::detect();
+        let powershell = chat_messages(Shell::Pwsh, &[], "C:\\work", &system_info, "show files");
+        assert!(
+            powershell[0]
+                .content
+                .contains("executable powershell command line")
+        );
+        assert!(
+            powershell[0]
+                .content
+                .contains("Windows PowerShell 5.1 and PowerShell 7")
+        );
+
+        let cmd = chat_messages(Shell::Cmd, &[], "C:\\work", &system_info, "show files");
+        assert!(cmd[0].content.contains("executable cmd command line"));
+        assert!(cmd[0].content.contains("Use cmd.exe built-ins"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod context;
+mod paths;
 mod provider;
 mod secure_fs;
 mod shell;
@@ -8,12 +9,12 @@ mod system_info;
 mod ui;
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::cli::{Action, Shell};
+use crate::cli::{Action, PromptSource, Shell};
 use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
 use crate::provider::{AiClient, GeneratedOutput};
@@ -29,7 +30,11 @@ fn main() {
 fn run() -> Result<()> {
     match cli::parse(env::args_os().skip(1))? {
         Action::Generate { shell, prompt } => {
-            let prompt = prompt.map_or_else(read_interactive_prompt, Ok)?;
+            let prompt = match prompt {
+                PromptSource::Interactive => read_interactive_prompt()?,
+                PromptSource::Argument(prompt) => prompt,
+                PromptSource::Stdin => read_stdin_prompt()?,
+            };
             generate(shell.unwrap_or_else(detect_shell), &prompt)
         }
         Action::Setup => {
@@ -53,7 +58,7 @@ fn run() -> Result<()> {
         Action::ContextShow => show_context(),
         Action::ContextClear => clear_context(),
         Action::Init(shell) => {
-            print!("{}", shell::init_script(shell));
+            print!("{}", shell::init_script(shell)?);
             Ok(())
         }
         Action::Help => {
@@ -89,6 +94,27 @@ fn read_interactive_prompt() -> Result<String> {
         bail!("the command description cannot be empty");
     }
     eprintln!("{}", ui::THINKING);
+    Ok(prompt.to_owned())
+}
+
+fn read_stdin_prompt() -> Result<String> {
+    const MAX_PROMPT_BYTES: u64 = 16 * 1024;
+
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(MAX_PROMPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("could not read the command description from stdin")?;
+    if bytes.len() as u64 > MAX_PROMPT_BYTES {
+        bail!("the command description from stdin exceeds {MAX_PROMPT_BYTES} bytes");
+    }
+
+    let prompt = String::from_utf8(bytes)
+        .context("the command description from stdin must be valid UTF-8")?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        bail!("the command description from stdin cannot be empty");
+    }
     Ok(prompt.to_owned())
 }
 
@@ -222,6 +248,11 @@ fn detect_shell() -> Shell {
             "bash" => Some(Shell::Bash),
             _ => None,
         })
-        // Bash is the conservative default for direct invocations outside a widget.
-        .unwrap_or(Shell::Bash)
+        .unwrap_or(DEFAULT_SHELL)
 }
+
+#[cfg(windows)]
+const DEFAULT_SHELL: Shell = Shell::Pwsh;
+
+#[cfg(not(windows))]
+const DEFAULT_SHELL: Shell = Shell::Bash;

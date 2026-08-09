@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -7,6 +6,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::paths;
 use crate::provider::Provider;
 use crate::secure_fs::{atomic_write_private, verify_private_file};
 use crate::ui;
@@ -74,17 +74,7 @@ impl Default for ContextConfig {
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        let base = match env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-            Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
-            _ => {
-                let home = env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .context("HOME is not set, so the configuration path cannot be determined")?;
-                PathBuf::from(home).join(".config")
-            }
-        };
-
-        Ok(base.join("aishell").join("config.toml"))
+        paths::config_file()
     }
 
     pub fn load() -> Result<Self> {
@@ -369,10 +359,14 @@ mod tests {
         let path = directory.path().join("aishell/config.toml");
         config().save_to(&path).unwrap();
 
+        let mut updated = config();
+        updated.provider.model = "openrouter/updated".into();
+        updated.save_to(&path).unwrap();
+
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.provider.kind, Provider::OpenRouter);
         assert_eq!(loaded.provider.api_key.as_deref(), Some("secret-value"));
-        assert_eq!(loaded.provider.model, "openrouter/auto");
+        assert_eq!(loaded.provider.model, "openrouter/updated");
 
         #[cfg(unix)]
         {
