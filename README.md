@@ -48,6 +48,39 @@ Each generated command is still only inserted into the editable command line.
 Review commands carefully—especially package-management, formatting, and
 privileged operations—before deciding whether to run them.
 
+## Command risk
+
+Every generated command must include one of three destructive-risk levels.
+`aishell` rejects a provider response that omits the risk or uses any value
+other than `safe`, `moderate`, or `high`, so an unclassified command is not
+inserted into the shell.
+
+| Risk | Message color | Meaning |
+| --- | --- | --- |
+| `safe` | Light green | Read-only commands with no meaningful side effects, such as inspecting files, processes, or repository state. |
+| `moderate` | Light yellow | Bounded, normally recoverable changes to files, packages, processes, or system state. |
+| `high` | Light red | Commands that can delete or overwrite data, make broad or difficult-to-reverse changes, expose secrets, execute untrusted remote code, or make a system unusable. |
+
+Classification considers the complete generated command and its context, not
+only the executable name. When the correct level is uncertain, the model is
+instructed to choose the higher risk. A moderate-risk message, shown in light
+yellow, looks like:
+
+```text
+⚠  · Command may modify your system or data. Review it carefully.
+```
+
+The message appears immediately before the editable command, with no countdown
+or automatic execution. With a direct `ai` invocation it is written to stderr,
+while the command remains the only stdout output. With the interactive shell
+integration it is displayed above the generated command line.
+
+The classification is review guidance produced by the configured model, not a
+security boundary or a guarantee that a command is harmless. Always inspect the
+complete command before pressing Enter. Setting `safety.risk_warning = false`
+hides the visible message only; the provider must still classify every command,
+and `aishell` still validates the classification.
+
 ## Build and configure
 
 Building requires Rust 1.95 or newer.
@@ -105,11 +138,8 @@ max_turns = 6
 risk_warning = true
 ```
 
-Every generated command is classified by the model as `safe`, `moderate`, or
-`high` destructive risk. Generated commands show a color-coded risk message:
-light green for safe, light yellow for moderate, and light red for high. Set
-`safety.risk_warning = false` to disable the message; risk classification
-remains part of the model response.
+The `[safety]` setting controls whether the color-coded message described in
+[Command risk](#command-risk) is displayed. It defaults to `true`.
 
 Useful configuration commands:
 
@@ -248,8 +278,8 @@ The complete generation flow is:
 4. The AI prompt is replaced in place by an animated dot spinner such as
    `⠋ ✨ Crafting command…` while `aishell` asks the configured model for either
    a command, a clarifying question, or an answer.
-5. A light green, light yellow, or light red message displays the command's
-   safe, moderate, or high destructive-risk classification.
+5. A light green, light yellow, or light red message immediately displays the
+   command's safe, moderate, or high destructive-risk classification.
 6. A generated command replaces the AI request in the same editable line. It
    remains unexecuted so it can be inspected or changed.
 7. Press Enter only after reviewing the generated command to execute it through

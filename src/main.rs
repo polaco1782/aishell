@@ -182,7 +182,9 @@ fn warn_before_command_with(risk: DestructiveRisk, stderr: &mut impl Write) -> R
     let consequence = match risk {
         DestructiveRisk::Safe => "is unlikely to cause damage, but review it carefully.",
         DestructiveRisk::Moderate => "may modify your system or data. Review it carefully.",
-        DestructiveRisk::High => "may cause destructive or difficult-to-reverse changes. Review it carefully.",
+        DestructiveRisk::High => {
+            "may cause destructive or difficult-to-reverse changes. Review it carefully."
+        }
     };
     writeln!(
         stderr,

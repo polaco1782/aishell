@@ -174,11 +174,19 @@ Tab behavior after installing the integration:
 
 A generated command replaces the AI request in the same editable line but is
 not executed. Review or edit it, then press Enter to execute it normally.
-Generated commands display a color-coded destructive-risk message unless
-`safety.risk_warning` is disabled in the config file.
 Clarifying questions and general answers are displayed without inserting an
 executable line. The direct `ai [description...]` CLI prints its result because
 only an installed shell integration can replace its parent shell's edit buffer.
+
+Command risk:
+  safe      light green; read-only with no meaningful side effects
+  moderate  light yellow; bounded, normally recoverable changes
+  high      light red; destructive, broad, secret-exposing, or difficult-to-reverse changes
+
+Every generated command must have an exact risk classification. The color-coded
+message appears immediately with no countdown. Setting `risk_warning = false`
+in the `[safety]` config section hides the message but does not disable
+classification or validation.
 
 The integration keeps a bounded command-generation context in one private state
 database. Use `ai context show` to inspect the current context or `clear` to
