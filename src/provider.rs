@@ -21,6 +21,7 @@ const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_CLARIFICATION_BYTES: usize = 1024;
 const MAX_ANSWER_BYTES: usize = 4096;
+const INVALID_RESPONSE_RETRIES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -186,25 +187,33 @@ impl AiClient {
         working_directory: &str,
         system_info: &SystemInfo,
     ) -> Result<GeneratedOutput, ProviderError> {
-        let body = ChatRequest::new(
-            self.provider,
-            &self.model,
-            chat_messages(shell, history, working_directory, system_info, request),
-            self.max_output_tokens,
-        );
-        let response = self
-            .authenticated(
-                self.client
-                    .post(self.endpoint("chat/completions"))
-                    .json(&body),
-            )
-            .send()
-            .map_err(|source| ProviderError::Transport {
-                provider: self.provider,
-                source,
-            })?;
-        let body = read_response(response, self.provider)?;
-        parse_chat_response(&body)
+        let messages = chat_messages(shell, history, working_directory, system_info, request);
+        retry_invalid_responses(|previous_error| {
+            let mut messages = messages.clone();
+            if let Some(error) = previous_error {
+                messages.push(Message {
+                    role: "user",
+                    content: format!(
+                        "Your previous response was invalid: {error}. Try again and follow the required output format exactly, without commentary."
+                    ),
+                });
+            }
+            let body =
+                ChatRequest::new(self.provider, &self.model, messages, self.max_output_tokens);
+            let response = self
+                .authenticated(
+                    self.client
+                        .post(self.endpoint("chat/completions"))
+                        .json(&body),
+                )
+                .send()
+                .map_err(|source| ProviderError::Transport {
+                    provider: self.provider,
+                    source,
+                })?;
+            let body = read_response(response, self.provider)?;
+            parse_chat_response(&body)
+        })
     }
 
     pub fn check(&self) -> Result<(), ProviderError> {
@@ -312,7 +321,7 @@ struct ChatTemplateConfig {
     enable_thinking: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Message {
     role: &'static str,
     content: String,
@@ -384,6 +393,21 @@ pub enum ProviderError {
     InvalidResponse(String),
     #[error("the generated command is invalid: {0}")]
     InvalidCommand(String),
+}
+
+fn retry_invalid_responses<T>(
+    mut attempt: impl FnMut(Option<&str>) -> Result<T, ProviderError>,
+) -> Result<T, ProviderError> {
+    let mut previous_error = None;
+    for retry in 0..=INVALID_RESPONSE_RETRIES {
+        match attempt(previous_error.as_deref()) {
+            Err(ProviderError::InvalidResponse(error)) if retry < INVALID_RESPONSE_RETRIES => {
+                previous_error = Some(error);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded retry loop always returns on its final attempt")
 }
 
 fn system_prompt(shell: Shell) -> String {
@@ -664,8 +688,8 @@ mod tests {
 
     use super::{
         ChatRequest, DestructiveRisk, GeneratedOutput, Message, Provider, ProviderError,
-        chat_messages, check_status, parse_chat_response, sanitize_error, validate_command,
-        verify_model_available,
+        chat_messages, check_status, parse_chat_response, retry_invalid_responses, sanitize_error,
+        validate_command, verify_model_available,
     };
 
     fn request(provider: Provider, model: &str) -> serde_json::Value {
@@ -860,6 +884,55 @@ mod tests {
             );
             assert!(parse_chat_response(&response).is_err());
         }
+    }
+
+    #[test]
+    fn retries_invalid_responses_three_times() {
+        let mut attempts = 0;
+        let output = retry_invalid_responses(|previous_error| {
+            attempts += 1;
+            if attempts <= 3 {
+                assert_eq!(previous_error, (attempts > 1).then_some("invalid format"));
+                return Err(ProviderError::InvalidResponse("invalid format".into()));
+            }
+            assert_eq!(previous_error, Some("invalid format"));
+            Ok("valid output")
+        })
+        .unwrap();
+
+        assert_eq!(output, "valid output");
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn returns_the_last_invalid_response_after_retries() {
+        let mut attempts = 0;
+        let error = retry_invalid_responses::<()>(|_| {
+            attempts += 1;
+            Err(ProviderError::InvalidResponse(format!(
+                "invalid attempt {attempts}"
+            )))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 4);
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message) if message == "invalid attempt 4"
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_non_response_errors() {
+        let mut attempts = 0;
+        let error = retry_invalid_responses::<()>(|_| {
+            attempts += 1;
+            Err(ProviderError::InvalidCommand("empty command".into()))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(matches!(error, ProviderError::InvalidCommand(_)));
     }
 
     #[test]
