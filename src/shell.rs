@@ -20,11 +20,61 @@ pub fn init_script(shell: Shell) -> Result<String> {
             "{{POWERSHELL_SPINNER_FRAMES}}",
             &ui::SPINNER_FRAMES
                 .split_whitespace()
-                .map(|frame| format!("'{frame}'"))
+                .map(powershell_string_expression)
                 .collect::<Vec<_>>()
                 .join(", "),
         )
+        .replace(
+            "{{POWERSHELL_AI_PROMPT}}",
+            &powershell_string_expression(ui::AI_PROMPT),
+        )
+        .replace(
+            "{{POWERSHELL_THINKING}}",
+            &powershell_string_expression(ui::THINKING),
+        )
+        .replace(
+            "{{POWERSHELL_ERROR}}",
+            &powershell_string_expression(ui::ERROR),
+        )
         .replace("{{ERROR}}", ui::ERROR))
+}
+
+/// Produces a PowerShell 5.1-compatible expression containing ASCII source
+/// only. Windows PowerShell may decode native stdout using an OEM code page,
+/// so embedding UTF-8 directly in `ai init powershell` corrupts the script
+/// before `Invoke-Expression` sees it.
+fn powershell_string_expression(value: &str) -> String {
+    let mut parts = Vec::new();
+    let mut ascii = String::new();
+
+    let flush_ascii = |ascii: &mut String, parts: &mut Vec<String>| {
+        if !ascii.is_empty() {
+            parts.push(format!("'{}'", ascii.replace('\'', "''")));
+            ascii.clear();
+        }
+    };
+
+    for character in value.chars() {
+        if character.is_ascii() {
+            ascii.push(character);
+            continue;
+        }
+
+        flush_ascii(&mut ascii, &mut parts);
+        let code_point = character as u32;
+        if code_point <= u16::MAX.into() {
+            parts.push(format!("([char]0x{code_point:04X})"));
+        } else {
+            parts.push(format!("([char]::ConvertFromUtf32(0x{code_point:X}))"));
+        }
+    }
+    flush_ascii(&mut ascii, &mut parts);
+
+    if parts.is_empty() {
+        "''".into()
+    } else {
+        parts.join(" + ")
+    }
 }
 
 // Bash cannot invoke its normal completion or accept-line widgets from a
@@ -343,8 +393,29 @@ if ($env:AISHELL_SESSION_OWNER_PID -ne [string]$PID) {
 
 Import-Module PSReadLine -MinimumVersion 2.0 -ErrorAction Stop
 
-$global:__AishellPromptPrefix = '# {{AI_PROMPT}}'
+$global:__AishellPromptPrefix = '# ' + ({{POWERSHELL_AI_PROMPT}})
+$global:__AishellThinking = {{POWERSHELL_THINKING}}
+$global:__AishellError = {{POWERSHELL_ERROR}}
 $global:__AishellSpinnerFrames = @({{POWERSHELL_SPINNER_FRAMES}})
+$global:__AishellUtf8Encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
+
+function global:Invoke-AishellUtf8Console {
+    param([scriptblock]$Action)
+
+    if ($PSVersionTable.PSEdition -ne 'Desktop') {
+        & $Action
+        return
+    }
+
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = $global:__AishellUtf8Encoding
+        & $Action
+    }
+    finally {
+        [Console]::OutputEncoding = $previousEncoding
+    }
+}
 
 function global:Set-AishellBuffer {
     param([string]$Text = '')
@@ -352,7 +423,17 @@ function global:Set-AishellBuffer {
     $line = $null
     [int]$cursor = 0
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-    [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $Text)
+    Invoke-AishellUtf8Console {
+        [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $Text)
+    }
+}
+
+function global:Write-AishellErrorLine {
+    param([AllowEmptyString()][string]$Message = '')
+
+    Invoke-AishellUtf8Console {
+        [Console]::Error.WriteLine($Message)
+    }
 }
 
 function global:Write-AishellDiagnostics {
@@ -361,8 +442,8 @@ function global:Write-AishellDiagnostics {
     if ([string]::IsNullOrWhiteSpace($Message)) {
         return
     }
-    [Console]::Error.WriteLine()
-    [Console]::Error.WriteLine($Message.TrimEnd([char[]]@("`r", "`n")))
+    Write-AishellErrorLine
+    Write-AishellErrorLine ($Message.TrimEnd([char[]]@("`r", "`n")))
     [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
 }
 
@@ -423,14 +504,14 @@ function global:Invoke-AishellGeneration {
                 }
                 if (-not $diagnosticsVisible) {
                     Set-AishellBuffer
-                    [Console]::Error.WriteLine()
+                    Write-AishellErrorLine
                 }
-                [Console]::Error.WriteLine($diagnosticLine)
+                Write-AishellErrorLine $diagnosticLine
                 $diagnosticsVisible = $true
                 $stderrLineTask = $process.StandardError.ReadLineAsync()
             }
             if (-not $diagnosticsVisible) {
-                Set-AishellBuffer ("{0} {{THINKING}}" -f $global:__AishellSpinnerFrames[$spinnerIndex])
+                Set-AishellBuffer ("{0} {1}" -f $global:__AishellSpinnerFrames[$spinnerIndex], $global:__AishellThinking)
                 $spinnerIndex = ($spinnerIndex + 1) % $global:__AishellSpinnerFrames.Count
             }
             $finished = $process.WaitForExit(80)
@@ -444,9 +525,9 @@ function global:Invoke-AishellGeneration {
             }
             if (-not $diagnosticsVisible) {
                 Set-AishellBuffer
-                [Console]::Error.WriteLine()
+                Write-AishellErrorLine
             }
-            [Console]::Error.WriteLine($diagnosticLine)
+            Write-AishellErrorLine $diagnosticLine
             $diagnosticsVisible = $true
             $stderrLineTask = $process.StandardError.ReadLineAsync()
         }
@@ -479,14 +560,14 @@ function global:Invoke-AishellGeneration {
     else {
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert($Line)
         if ($diagnosticsVisible) {
-            $diagnostics = '{{ERROR}} Generation failed; request kept for editing'
+            $diagnostics = $global:__AishellError + ' Generation failed; request kept for editing'
         }
         elseif (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
             $diagnostics += "`n"
-            $diagnostics += '{{ERROR}} Generation failed; request kept for editing'
+            $diagnostics += $global:__AishellError + ' Generation failed; request kept for editing'
         }
         else {
-            $diagnostics = '{{ERROR}} Generation failed; request kept for editing'
+            $diagnostics = $global:__AishellError + ' Generation failed; request kept for editing'
         }
     }
     Write-AishellDiagnostics $diagnostics
@@ -511,7 +592,15 @@ $global:__AishellTabHandler = {
         }
         return
     }
-    [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__AishellPromptPrefix)
+    Invoke-AishellUtf8Console {
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__AishellPromptPrefix)
+        # Windows PowerShell 5.1 / PSReadLine 2.0 can render programmatically
+        # inserted Unicode as fallback characters until the next keypress
+        # forces a complete redraw. InvokePrompt performs it immediately.
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+        }
+    }
 }
 
 $global:__AishellEnterHandler = {
@@ -609,7 +698,12 @@ mod tests {
     fn powershell_uses_psreadline_without_executing_generated_commands() {
         let script = init_script(Shell::Pwsh).unwrap();
         assert!(script.contains("Import-Module PSReadLine -MinimumVersion 2.0"));
-        assert!(script.contains("$global:__AishellPromptPrefix = '# 🤖 AI Prompt › '"));
+        assert!(script.is_ascii());
+        assert!(script.contains("[char]::ConvertFromUtf32(0x1F916)"));
+        assert!(script.contains("[char]0x203A"));
+        assert!(script.contains("$global:__AishellPromptPrefix = '# ' + ("));
+        assert!(script.contains("$global:__AishellThinking = ([char]0x2728)"));
+        assert!(script.contains("$global:__AishellError = ([char]0x2717)"));
         assert!(script.contains("GetBufferState([ref]$line, [ref]$cursor)"));
         assert!(script.contains("::Replace(0, $line.Length, $Text)"));
         assert!(script.contains("::TabCompleteNext()"));
@@ -620,13 +714,18 @@ mod tests {
         assert!(script.contains("$process.StandardInput.BaseStream.Write($requestBytes"));
         assert!(script.contains("$process.WaitForExit(80)"));
         assert!(script.contains("$process.StandardError.ReadLineAsync()"));
-        assert!(script.contains("[Console]::Error.WriteLine($diagnosticLine)"));
+        assert!(script.contains("Write-AishellErrorLine $diagnosticLine"));
         assert!(script.contains("::Insert($generated)"));
+        assert!(script.contains("[Console]::OutputEncoding = $global:__AishellUtf8Encoding"));
+        assert!(script.contains("[Console]::OutputEncoding = $previousEncoding"));
+        assert!(script.contains("function global:Write-AishellErrorLine"));
+        assert!(script.contains("$PSVersionTable.PSEdition -eq 'Desktop'"));
+        assert!(script.contains("[Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()"));
         assert!(!script.contains("Invoke-Expression"));
         assert!(!script.contains(
             "::AcceptLine()\n        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($generated)"
         ));
-        assert!(script.contains("'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'"));
+        assert!(script.contains("([char]0x280B), ([char]0x2819), ([char]0x2839)"));
         assert!(script.contains("AISHELL_SESSION_ID = \"powershell-$PID-"));
         assert!(!script.contains("{{"));
     }

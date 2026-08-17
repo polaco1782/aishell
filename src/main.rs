@@ -7,6 +7,8 @@ mod secure_fs;
 mod shell;
 mod system_info;
 mod ui;
+#[cfg(windows)]
+mod windows_console;
 
 use std::env;
 use std::io::{self, Read, Write};

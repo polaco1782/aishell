@@ -199,6 +199,10 @@ pub fn interactive_setup() -> Result<PathBuf> {
         bail!("`ai setup` must be run from an interactive terminal");
     }
 
+    #[cfg(windows)]
+    crate::windows_console::restore_line_input()
+        .context("could not restore the Windows console input mode")?;
+
     let path = Config::path()?;
     let existing = if path.exists() {
         let contents = Config::read_from(&path)?;
@@ -247,7 +251,15 @@ pub fn interactive_setup() -> Result<PathBuf> {
     };
     let password_config = rpassword::ConfigBuilder::new()
         .password_feedback_mask('*')
+        // rpassword's default CONOUT$ prompt writer emits raw UTF-8 bytes,
+        // which legacy Windows consoles decode with their OEM code page.
+        // Rust's stdout writes Unicode correctly to a console and UTF-8 when
+        // redirected, matching the other setup prompts.
+        .output_writer(std::io::stdout())
         .build();
+    #[cfg(windows)]
+    let _console_mode_guard = crate::windows_console::ConsoleModeGuard::install()
+        .context("could not protect the Windows console input mode")?;
     let entered_key = rpassword::prompt_password_with_config(key_prompt, password_config)
         .context("could not read the API key")?;
     let api_key = match (entered_key.trim(), existing_provider) {
@@ -351,6 +363,7 @@ const fn default_context_max_turns() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
 
     use tempfile::tempdir;
