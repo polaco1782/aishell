@@ -23,6 +23,8 @@ pub struct Config {
     pub generation: GenerationConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
     pub safety: SafetyConfig,
 }
 
@@ -53,6 +55,13 @@ pub struct ContextConfig {
     pub enabled: bool,
     #[serde(default = "default_context_max_turns")]
     pub max_turns: usize,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub file_io: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -175,7 +184,7 @@ impl Config {
             .map(|_| "api_key = \"<redacted>\"\n")
             .unwrap_or_default();
         format!(
-            "[provider]\ntype = {:?}\n{api_key}model = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n\n[safety]\nrisk_warning = {}\n",
+            "[provider]\ntype = {:?}\n{api_key}model = {:?}\nbase_url = {:?}\n\n[generation]\ntimeout_seconds = {}\nmax_output_tokens = {}\n\n[context]\nenabled = {}\nmax_turns = {}\n\n[tools]\nfile_io = {}\n\n[safety]\nrisk_warning = {}\n",
             self.provider.kind.as_str(),
             self.provider.model,
             self.provider.base_url,
@@ -183,6 +192,7 @@ impl Config {
             self.generation.max_output_tokens,
             self.context.enabled,
             self.context.max_turns,
+            self.tools.file_io,
             self.safety.risk_warning
         )
     }
@@ -303,6 +313,10 @@ pub fn interactive_setup() -> Result<PathBuf> {
         .as_ref()
         .map(|config| config.context.clone())
         .unwrap_or_default();
+    let tools = existing
+        .as_ref()
+        .map(|config| config.tools.clone())
+        .unwrap_or_default();
     let safety = existing
         .as_ref()
         .map(|config| config.safety.clone())
@@ -316,6 +330,7 @@ pub fn interactive_setup() -> Result<PathBuf> {
         },
         generation,
         context,
+        tools,
         safety,
     };
     config.save_to(&path)?;
@@ -370,7 +385,10 @@ mod tests {
 
     use std::str::FromStr;
 
-    use super::{Config, ContextConfig, GenerationConfig, Provider, ProviderConfig, SafetyConfig};
+    use super::{
+        Config, ContextConfig, GenerationConfig, Provider, ProviderConfig, SafetyConfig,
+        ToolsConfig,
+    };
 
     fn config() -> Config {
         Config {
@@ -382,6 +400,7 @@ mod tests {
             },
             generation: GenerationConfig::default(),
             context: ContextConfig::default(),
+            tools: ToolsConfig::default(),
             safety: SafetyConfig::default(),
         }
     }
@@ -451,6 +470,18 @@ risk_warning = true
 
         assert!(parsed.context.enabled);
         assert_eq!(parsed.context.max_turns, 6);
+        assert!(!parsed.tools.file_io);
+    }
+
+    #[test]
+    fn file_tools_are_optional_and_visible_in_redacted_configuration() {
+        let mut config = config();
+        config.tools.file_io = true;
+
+        let serialized = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(parsed.tools.file_io);
+        assert!(config.redacted_toml().contains("[tools]\nfile_io = true"));
     }
 
     #[test]

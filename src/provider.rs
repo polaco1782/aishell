@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use thiserror::Error;
 use crate::cli::Shell;
 use crate::config::Config;
 use crate::context::ContextTurn;
+use crate::file_tools::{READ_FILE_TOOL, WRITE_FILE_TOOL, WorkspaceFiles};
 use crate::system_info::SystemInfo;
 
 mod llama_cpp;
@@ -22,6 +24,7 @@ const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_CLARIFICATION_BYTES: usize = 1024;
 const MAX_ANSWER_BYTES: usize = 4096;
 const INVALID_RESPONSE_RETRIES: usize = 3;
+const MAX_FILE_TOOL_CALLS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -146,6 +149,7 @@ pub struct AiClient {
     model: String,
     base_url: String,
     max_output_tokens: u32,
+    file_io: bool,
 }
 
 impl AiClient {
@@ -176,6 +180,7 @@ impl AiClient {
                 .trim_end_matches('/')
                 .to_owned(),
             max_output_tokens: config.generation.max_output_tokens,
+            file_io: config.tools.file_io,
         })
     }
 
@@ -184,22 +189,33 @@ impl AiClient {
         request: &str,
         shell: Shell,
         history: &[ContextTurn],
-        working_directory: &str,
+        working_directory: &Path,
         system_info: &SystemInfo,
     ) -> Result<GeneratedOutput, ProviderError> {
-        let messages = chat_messages(shell, history, working_directory, system_info, request);
-        retry_invalid_responses(|previous_error| {
-            let mut messages = messages.clone();
-            if let Some(error) = previous_error {
-                messages.push(Message {
-                    role: "user",
-                    content: format!(
-                        "Your previous response was invalid: {error}. Try again and follow the required output format exactly, without commentary."
-                    ),
-                });
-            }
-            let body =
-                ChatRequest::new(self.provider, &self.model, messages, self.max_output_tokens);
+        let workspace = self
+            .file_io
+            .then(|| WorkspaceFiles::new(working_directory))
+            .transpose()
+            .map_err(|error| ProviderError::FileTools(error.to_string()))?;
+        let mut messages = chat_messages(
+            shell,
+            history,
+            &working_directory.to_string_lossy(),
+            system_info,
+            request,
+            self.file_io,
+        );
+        let mut invalid_retries = 0;
+        let mut tool_call_count = 0;
+
+        loop {
+            let body = ChatRequest::new(
+                self.provider,
+                &self.model,
+                messages.clone(),
+                self.max_output_tokens,
+                self.file_io,
+            );
             let response = self
                 .authenticated(
                     self.client
@@ -212,8 +228,49 @@ impl AiClient {
                     source,
                 })?;
             let body = read_response(response, self.provider)?;
-            parse_chat_response(&body)
-        })
+            let mut choice = parse_chat_choice(&body)?;
+
+            if !choice.message.tool_calls.is_empty() {
+                let workspace = workspace.as_ref().ok_or_else(|| {
+                    ProviderError::InvalidResponse(
+                        "the model requested a tool when no tools were available".into(),
+                    )
+                })?;
+                if tool_call_count + choice.message.tool_calls.len() > MAX_FILE_TOOL_CALLS {
+                    return Err(ProviderError::ToolLimitExceeded);
+                }
+                normalize_tool_call_ids(&mut choice.message.tool_calls, tool_call_count);
+                tool_call_count += choice.message.tool_calls.len();
+
+                messages.push(Message::assistant_tool_calls(
+                    choice.message.content,
+                    choice.message.tool_calls.clone(),
+                ));
+                for tool_call in choice.message.tool_calls {
+                    let result = workspace.execute(
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                    );
+                    messages.push(Message::tool(tool_call.id, result));
+                }
+                continue;
+            }
+
+            match parse_choice_output(&choice) {
+                Err(ProviderError::InvalidResponse(error))
+                    if invalid_retries < INVALID_RESPONSE_RETRIES =>
+                {
+                    invalid_retries += 1;
+                    if let Some(content) = choice.message.content {
+                        messages.push(Message::assistant(content));
+                    }
+                    messages.push(Message::user(format!(
+                        "Your previous response was invalid: {error}. Try again and follow the required output format exactly, without commentary."
+                    )));
+                }
+                result => return result,
+            }
+        }
     }
 
     pub fn check(&self) -> Result<(), ProviderError> {
@@ -281,6 +338,10 @@ struct ChatRequest<'a> {
     reasoning_format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<ChatTemplateConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -289,6 +350,7 @@ impl<'a> ChatRequest<'a> {
         model: &'a str,
         messages: Vec<Message>,
         max_output_tokens: u32,
+        file_io: bool,
     ) -> Self {
         let request_style = provider.spec().request_style;
         let is_openai = matches!(request_style, RequestStyle::Official);
@@ -307,6 +369,8 @@ impl<'a> ChatRequest<'a> {
             chat_template_kwargs: is_llama_cpp.then_some(ChatTemplateConfig {
                 enable_thinking: false,
             }),
+            tools: file_io.then(file_tool_definitions),
+            parallel_tool_calls: file_io.then_some(false),
         }
     }
 }
@@ -324,7 +388,52 @@ struct ChatTemplateConfig {
 #[derive(Clone, Serialize)]
 struct Message {
     role: &'static str,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl Message {
+    fn system(content: String) -> Self {
+        Self::plain("system", content)
+    }
+
+    fn user(content: String) -> Self {
+        Self::plain("user", content)
+    }
+
+    fn assistant(content: String) -> Self {
+        Self::plain("assistant", content)
+    }
+
+    fn plain(role: &'static str, content: String) -> Self {
+        Self {
+            role,
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant",
+            content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool(tool_call_id: String, content: String) -> Self {
+        Self {
+            role: "tool",
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -341,6 +450,38 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: FunctionCall,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct FunctionCall {
+    name: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct ToolDefinition {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunctionDefinition,
+}
+
+#[derive(Serialize)]
+struct ToolFunctionDefinition {
+    name: &'static str,
+    description: &'static str,
+    parameters: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -361,6 +502,84 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct Model {
     id: String,
+}
+
+fn file_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            kind: "function",
+            function: ToolFunctionDefinition {
+                name: READ_FILE_TOOL,
+                description: "Read a UTF-8 text file below the current working directory. Use byte offsets to continue a large file. Paths must be relative, and reads are limited to 32768 bytes per call.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path relative to the current working directory"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Byte offset to start reading at; defaults to 0"
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 32768,
+                            "description": "Maximum bytes to return; defaults to 16384"
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            kind: "function",
+            function: ToolFunctionDefinition {
+                name: WRITE_FILE_TOOL,
+                description: "Atomically replace or create one UTF-8 text file below the current working directory. Existing permissions are preserved. Use only when the current user request explicitly asks to create or change a file. Paths must be relative, parent directories must exist, and content is limited to 65536 bytes.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path relative to the current working directory"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Complete replacement contents of the file"
+                        }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+    ]
+}
+
+fn deserialize_tool_arguments<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(arguments) => Ok(arguments),
+        arguments @ serde_json::Value::Object(_) => Ok(arguments.to_string()),
+        _ => Err(serde::de::Error::custom(
+            "tool arguments must be a JSON string or object",
+        )),
+    }
+}
+
+fn normalize_tool_call_ids(tool_calls: &mut [ToolCall], first_index: usize) {
+    for (index, call) in tool_calls.iter_mut().enumerate() {
+        if call.id.trim().is_empty() {
+            call.id = format!("aishell-tool-{}", first_index + index + 1);
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -389,6 +608,10 @@ pub enum ProviderError {
     InvalidUtf8 { provider: Provider },
     #[error("the configured model {model:?} is not served by {provider}")]
     ModelUnavailable { provider: Provider, model: String },
+    #[error("file tools are unavailable: {0}")]
+    FileTools(String),
+    #[error("the model exceeded the limit of {MAX_FILE_TOOL_CALLS} file tool calls")]
+    ToolLimitExceeded,
     #[error("the AI provider returned an invalid response: {0}")]
     InvalidResponse(String),
     #[error("the generated command is invalid: {0}")]
@@ -410,7 +633,12 @@ fn retry_invalid_responses<T>(
     unreachable!("the bounded retry loop always returns on its final attempt")
 }
 
-fn system_prompt(shell: Shell) -> String {
+fn system_prompt(shell: Shell, file_io: bool) -> String {
+    let file_guidance = if file_io {
+        "Workspace file tools are available only below the current working directory. Use read_file when file contents are needed. Use write_file only when the current request explicitly asks to create or change a file; a prior request is not authorization. File tool writes happen immediately, so do not emit COMMAND for an operation already completed with a tool. After tool work, report the result with ANSWER. Never use a shell command to bypass a file tool boundary. "
+    } else {
+        ""
+    };
     format!(
         "You are an AI assistant embedded in an interactive shell. The user may request a shell \
 operation or ask a general question, in any language. For a command, output exactly two lines in \
@@ -437,11 +665,12 @@ an editable shell buffer: they may have been changed or never executed, so never
 effects occurred. Host system metadata in the current request is factual local context. For \
 platform-dependent commands, use it to select commands and packages compatible with the reported \
 operating system, distribution family, and version. Do not assume a different distribution or \
-package manager unless the user requests one. {} A new command will also be shown for review and must \
+package manager unless the user requests one. {}{} A new command will also be shown for review and must \
 not be described as already executed.",
         shell.as_str(),
         shell.as_str(),
-        shell.generation_guidance()
+        shell.generation_guidance(),
+        file_guidance
     )
 }
 
@@ -451,26 +680,19 @@ fn chat_messages(
     working_directory: &str,
     system_info: &SystemInfo,
     request: &str,
+    file_io: bool,
 ) -> Vec<Message> {
     let mut messages = Vec::with_capacity(2 + history.len() * 2);
-    messages.push(Message {
-        role: "system",
-        content: system_prompt(shell),
-    });
+    messages.push(Message::system(system_prompt(shell, file_io)));
     for turn in history {
-        messages.push(Message {
-            role: "user",
-            content: historical_user_prompt(turn),
-        });
-        messages.push(Message {
-            role: "assistant",
-            content: turn.response.model_line(),
-        });
+        messages.push(Message::user(historical_user_prompt(turn)));
+        messages.push(Message::assistant(turn.response.model_line()));
     }
-    messages.push(Message {
-        role: "user",
-        content: user_prompt(working_directory, system_info, request),
-    });
+    messages.push(Message::user(user_prompt(
+        working_directory,
+        system_info,
+        request,
+    )));
     messages
 }
 
@@ -538,21 +760,34 @@ fn verify_model_available(
 }
 
 fn parse_chat_response(body: &str) -> Result<GeneratedOutput, ProviderError> {
+    let choice = parse_chat_choice(body)?;
+    if !choice.message.tool_calls.is_empty() {
+        return Err(ProviderError::InvalidResponse(
+            "a final response was expected, but the model requested a tool".into(),
+        ));
+    }
+    parse_choice_output(&choice)
+}
+
+fn parse_chat_choice(body: &str) -> Result<Choice, ProviderError> {
     let response: ChatResponse = serde_json::from_str(body)
         .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-    let choice = response
+    response
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| ProviderError::InvalidResponse("no choice was returned".into()))?;
-    let content = choice.message.content.ok_or_else(|| {
+        .ok_or_else(|| ProviderError::InvalidResponse("no choice was returned".into()))
+}
+
+fn parse_choice_output(choice: &Choice) -> Result<GeneratedOutput, ProviderError> {
+    let content = choice.message.content.as_deref().ok_or_else(|| {
         let reason = match choice.finish_reason.as_deref() {
             Some("length") => "the output token limit was reached before text was returned",
             _ => "no text choice was returned",
         };
         ProviderError::InvalidResponse(reason.into())
     })?;
-    parse_generated_output(&content)
+    parse_generated_output(content)
 }
 
 fn parse_generated_output(content: &str) -> Result<GeneratedOutput, ProviderError> {

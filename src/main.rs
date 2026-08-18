@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod context;
+mod file_tools;
 mod paths;
 mod provider;
 mod secure_fs;
@@ -143,9 +144,10 @@ fn generate(shell: Shell, prompt: &str) -> Result<()> {
     } else {
         (None, Vec::new())
     };
-    let working_directory = context
-        .as_ref()
-        .map_or(fallback_directory.as_str(), ContextStore::working_directory);
+    let working_directory = context.as_ref().map_or_else(
+        || Path::new(&fallback_directory),
+        |store| Path::new(store.working_directory()),
+    );
     let system_info = SystemInfo::detect();
     let output = client.generate(prompt, shell, &history, working_directory, &system_info)?;
 

@@ -74,10 +74,22 @@ pub fn atomic_write_private(path: &Path, contents: &[u8], description: &str) -> 
         }
     }
 
+    atomic_write_file(path, contents, description, private_permissions())
+}
+
+pub fn atomic_write_file(
+    path: &Path,
+    contents: &[u8],
+    description: &str,
+    permissions: Option<fs::Permissions>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("the file path has no parent directory")?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("private-file");
+        .unwrap_or("file");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -85,7 +97,12 @@ pub fn atomic_write_private(path: &Path, contents: &[u8], description: &str) -> 
     let temporary_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
 
     let write_result = (|| -> Result<()> {
-        let mut temporary = open_private_file(&temporary_path, "temporary file")?;
+        let mut temporary = open_new_file(&temporary_path, "temporary file")?;
+        if let Some(permissions) = permissions {
+            temporary
+                .set_permissions(permissions)
+                .context("could not set temporary file permissions")?;
+        }
         temporary
             .write_all(contents)
             .context("could not write temporary file")?;
@@ -102,6 +119,18 @@ pub fn atomic_write_private(path: &Path, contents: &[u8], description: &str) -> 
         let _ = fs::remove_file(&temporary_path);
     }
     write_result
+}
+
+#[cfg(unix)]
+fn private_permissions() -> Option<fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Some(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+const fn private_permissions() -> Option<fs::Permissions> {
+    None
 }
 
 #[cfg(not(windows))]
@@ -217,6 +246,27 @@ fn open_private_file(path: &Path, description: &str) -> Result<File> {
         .create_new(true)
         .write(true)
         .mode(0o600)
+        .open(path)
+        .with_context(|| format!("could not create {description} at {}", path.display()))
+}
+
+#[cfg(unix)]
+fn open_new_file(path: &Path, description: &str) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o666)
+        .open(path)
+        .with_context(|| format!("could not create {description} at {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_new_file(path: &Path, description: &str) -> Result<File> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
         .open(path)
         .with_context(|| format!("could not create {description} at {}", path.display()))
 }
