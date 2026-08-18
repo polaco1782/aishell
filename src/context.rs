@@ -5,14 +5,17 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::file_tools::{FileIoEvent, FileIoOperation, FileIoOutcome};
 use crate::paths;
 use crate::secure_fs::{create_private_file, verify_private_file};
 
 const DATABASE_FILE_NAME: &str = "history.sqlite3";
 const DATABASE_APPLICATION_ID: i64 = 0x4149_5348;
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 4;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_STORED_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_STORED_FILE_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_STORED_FAILURE_REASON_BYTES: usize = 8 * 1024;
 const TURNS_TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL REFERENCES contexts(scope) ON DELETE CASCADE,
@@ -23,6 +26,29 @@ const TURNS_TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS turns (
     response TEXT NOT NULL
 )";
 const TURNS_INDEX_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS turns_scope_id ON turns(scope, id)";
+const FILE_IO_LOG_TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS file_io_log (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    working_directory TEXT NOT NULL,
+    request TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('read', 'write', 'modify')),
+    path TEXT,
+    byte_offset INTEGER CHECK(byte_offset IS NULL OR byte_offset >= 0),
+    content TEXT,
+    failure_reason TEXT,
+    CHECK((content IS NULL) != (failure_reason IS NULL)),
+    CHECK(
+        failure_reason IS NOT NULL OR (
+            path IS NOT NULL AND (
+                (operation = 'read' AND byte_offset IS NOT NULL) OR
+                (operation IN ('write', 'modify') AND byte_offset IS NULL)
+            )
+        )
+    )
+)";
+const FILE_IO_LOG_INDEX_SCHEMA: &str =
+    "CREATE INDEX IF NOT EXISTS file_io_log_scope_id ON file_io_log(scope, id)";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextResponse {
@@ -72,6 +98,14 @@ pub struct ContextTurn {
     pub working_directory: String,
     pub request: String,
     pub response: ContextResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileIoLogEntry {
+    pub created_at: i64,
+    pub working_directory: String,
+    pub request: String,
+    pub event: FileIoEvent,
 }
 
 pub struct ContextStore {
@@ -168,12 +202,108 @@ impl ContextStore {
         .collect()
     }
 
+    pub fn load_file_io_log(&self) -> Result<Vec<FileIoLogEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT created_at, working_directory, request, operation, path, byte_offset, content,
+                    failure_reason
+             FROM file_io_log
+             WHERE scope = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([&self.scope], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        rows.map(|row| {
+            let (
+                created_at,
+                working_directory,
+                request,
+                operation,
+                path,
+                offset,
+                content,
+                failure_reason,
+            ) = row?;
+            let offset = offset
+                .map(u64::try_from)
+                .transpose()
+                .context("file I/O log contains a negative byte offset")?;
+            let outcome = match (content, failure_reason) {
+                (Some(content), None) => FileIoOutcome::Succeeded { content },
+                (None, Some(reason)) => FileIoOutcome::Failed { reason },
+                _ => bail!("file I/O log contains an invalid outcome"),
+            };
+            Ok(FileIoLogEntry {
+                created_at,
+                working_directory,
+                request,
+                event: FileIoEvent {
+                    operation: FileIoOperation::from_str(&operation)?,
+                    path,
+                    offset,
+                    outcome,
+                },
+            })
+        })
+        .collect()
+    }
+
+    pub fn append_file_io(&self, request: &str, event: &FileIoEvent) -> Result<()> {
+        validate_stored_request(request)?;
+        let (content, failure_reason) = match &event.outcome {
+            FileIoOutcome::Succeeded { content } => {
+                if content.len() > MAX_STORED_FILE_CONTENT_BYTES {
+                    bail!(
+                        "file content is too large to save in the audit log (maximum {MAX_STORED_FILE_CONTENT_BYTES} bytes)"
+                    );
+                }
+                (Some(content.as_str()), None)
+            }
+            FileIoOutcome::Failed { reason } => {
+                if reason.len() > MAX_STORED_FAILURE_REASON_BYTES {
+                    bail!(
+                        "failure reason is too large to save in the audit log (maximum {MAX_STORED_FAILURE_REASON_BYTES} bytes)"
+                    );
+                }
+                (None, Some(reason.as_str()))
+            }
+        };
+        let offset = event
+            .offset
+            .map(i64::try_from)
+            .transpose()
+            .context("file byte offset is too large to save in the audit log")?;
+        self.connection.execute(
+            "INSERT INTO file_io_log(
+                 scope, created_at, working_directory, request, operation, path, byte_offset, content,
+                 failure_reason
+             ) VALUES (?1, unixepoch(), ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                self.scope,
+                self.working_directory,
+                request,
+                event.operation.as_str(),
+                event.path,
+                offset,
+                content,
+                failure_reason
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn append(&mut self, request: &str, response: &ContextResponse) -> Result<()> {
-        if request.len() > MAX_STORED_REQUEST_BYTES {
-            bail!(
-                "request is too large to save in context (maximum {MAX_STORED_REQUEST_BYTES} bytes)"
-            );
-        }
+        validate_stored_request(request)?;
 
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -211,15 +341,26 @@ impl ContextStore {
 
     pub fn clear(&mut self) -> Result<bool> {
         let transaction = self.connection.transaction()?;
-        let removed =
+        let removed_context =
             transaction.execute("DELETE FROM contexts WHERE scope = ?1", [&self.scope])?;
+        let removed_logs =
+            transaction.execute("DELETE FROM file_io_log WHERE scope = ?1", [&self.scope])?;
         transaction.commit()?;
-        Ok(removed != 0)
+        Ok(removed_context != 0 || removed_logs != 0)
     }
 
     pub fn path_ref(&self) -> &Path {
         &self.path
     }
+}
+
+fn validate_stored_request(request: &str) -> Result<()> {
+    if request.len() > MAX_STORED_REQUEST_BYTES {
+        bail!(
+            "request is too large to save in the database (maximum {MAX_STORED_REQUEST_BYTES} bytes)"
+        );
+    }
+    Ok(())
 }
 
 fn initialize_database(connection: &Connection) -> Result<()> {
@@ -252,6 +393,8 @@ fn initialize_database(connection: &Connection) -> Result<()> {
          );
          {TURNS_TABLE_SCHEMA};
          {TURNS_INDEX_SCHEMA};
+         {FILE_IO_LOG_TABLE_SCHEMA};
+         {FILE_IO_LOG_INDEX_SCHEMA};
          PRAGMA application_id = {DATABASE_APPLICATION_ID};
          PRAGMA user_version = {DATABASE_SCHEMA_VERSION};"
     ))?;
@@ -293,6 +436,7 @@ mod tests {
         ContextResponse, ContextStore, DATABASE_APPLICATION_ID, DATABASE_SCHEMA_VERSION,
         initialize_database, valid_session_id,
     };
+    use crate::file_tools::{FileIoEvent, FileIoOperation, FileIoOutcome};
     use crate::secure_fs::create_private_file;
 
     #[test]
@@ -332,6 +476,14 @@ mod tests {
             .unwrap();
         assert_eq!(application_id, DATABASE_APPLICATION_ID);
         assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
+        let audit_table: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'file_io_log'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_table, "file_io_log");
         assert!(fs::metadata(path).unwrap().is_file());
     }
 
@@ -339,7 +491,7 @@ mod tests {
     fn rejects_an_obsolete_database_version() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         initialize_database(&connection).unwrap();
-        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
 
         assert!(initialize_database(&connection).is_err());
     }
@@ -369,13 +521,59 @@ mod tests {
         store
             .append("third", &ContextResponse::Answer("Third answer.".into()))
             .unwrap();
+        store
+            .append_file_io(
+                "inspect the script",
+                &FileIoEvent {
+                    operation: FileIoOperation::Read,
+                    path: Some("script.sh".into()),
+                    offset: Some(12),
+                    outcome: FileIoOutcome::Succeeded {
+                        content: "echo hello\n".into(),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_file_io(
+                "inspect a denied file",
+                &FileIoEvent {
+                    operation: FileIoOperation::Read,
+                    path: Some("../secret".into()),
+                    offset: None,
+                    outcome: FileIoOutcome::Failed {
+                        reason: "path cannot contain parent or root components".into(),
+                    },
+                },
+            )
+            .unwrap();
 
         let turns = store.load().unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].request, "second");
         assert_eq!(turns[1].request, "third");
+        let audit = store.load_file_io_log().unwrap();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].request, "inspect the script");
+        assert_eq!(audit[0].event.operation, FileIoOperation::Read);
+        assert_eq!(audit[0].event.path.as_deref(), Some("script.sh"));
+        assert_eq!(audit[0].event.offset, Some(12));
+        assert_eq!(
+            audit[0].event.outcome,
+            FileIoOutcome::Succeeded {
+                content: "echo hello\n".into()
+            }
+        );
+        assert_eq!(audit[1].event.path.as_deref(), Some("../secret"));
+        assert_eq!(
+            audit[1].event.outcome,
+            FileIoOutcome::Failed {
+                reason: "path cannot contain parent or root components".into()
+            }
+        );
         assert!(store.clear().unwrap());
         assert!(store.load().unwrap().is_empty());
+        assert!(store.load_file_io_log().unwrap().is_empty());
 
         #[cfg(unix)]
         {

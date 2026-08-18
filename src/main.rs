@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{Action, PromptSource, Shell};
 use crate::config::Config;
 use crate::context::{ContextResponse, ContextStore};
+use crate::file_tools::FileIoOutcome;
 use crate::provider::{AiClient, DestructiveRisk, GeneratedOutput};
 use crate::system_info::SystemInfo;
 
@@ -60,6 +61,7 @@ fn run() -> Result<()> {
         }
         Action::ContextShow => show_context(),
         Action::ContextClear => clear_context(),
+        Action::Logs => show_logs(),
         Action::Init(shell) => {
             print!("{}", shell::init_script(shell)?);
             Ok(())
@@ -124,34 +126,58 @@ fn read_stdin_prompt() -> Result<String> {
 fn generate(shell: Shell, prompt: &str) -> Result<()> {
     let config = Config::load()?;
     let client = AiClient::new(&config)?;
-    let fallback_directory = env::current_dir()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "<unknown>".into());
-    let (mut context, history) = if config.context.enabled {
+    let needs_database = config.context.enabled || config.tools.file_io;
+    let mut context = if needs_database {
         match ContextStore::open(config.context.max_turns) {
-            Ok(store) => match store.load() {
-                Ok(history) => (Some(store), history),
-                Err(error) => {
-                    eprintln!("{} Context could not be loaded · {error:#}", ui::WARNING);
-                    (None, Vec::new())
-                }
-            },
+            Ok(store) => Some(store),
+            Err(error) if config.tools.file_io => {
+                return Err(error).context("file I/O auditing is unavailable");
+            }
             Err(error) => {
                 eprintln!("{} Context is unavailable · {error:#}", ui::WARNING);
-                (None, Vec::new())
+                None
             }
         }
     } else {
-        (None, Vec::new())
+        None
     };
-    let working_directory = context.as_ref().map_or_else(
-        || Path::new(&fallback_directory),
-        |store| Path::new(store.working_directory()),
-    );
+    let history = if config.context.enabled {
+        context.as_ref().map_or_else(Vec::new, |store| {
+            store.load().unwrap_or_else(|error| {
+                eprintln!("{} Context could not be loaded · {error:#}", ui::WARNING);
+                Vec::new()
+            })
+        })
+    } else {
+        Vec::new()
+    };
+    let working_directory = context
+        .as_ref()
+        .map(|store| store.working_directory().into())
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| "<unknown>".into());
     let system_info = SystemInfo::detect();
-    let output = client.generate(prompt, shell, &history, working_directory, &system_info)?;
+    let output = client.generate(
+        prompt,
+        shell,
+        &history,
+        &working_directory,
+        &system_info,
+        |event| {
+            context
+                .as_ref()
+                .ok_or_else(|| "file I/O auditing is unavailable".to_owned())
+                .and_then(|store| {
+                    store
+                        .append_file_io(prompt, event)
+                        .map_err(|error| format!("{error:#}"))
+                })
+        },
+    )?;
 
-    if let Some(store) = context.as_mut() {
+    if config.context.enabled
+        && let Some(store) = context.as_mut()
+    {
         let response = match &output {
             GeneratedOutput::Command { command, .. } => ContextResponse::Command(command.clone()),
             GeneratedOutput::Clarification(question) => {
@@ -256,6 +282,87 @@ fn clear_context() -> Result<()> {
     Ok(())
 }
 
+fn show_logs() -> Result<()> {
+    let config = Config::load()?;
+    let store = ContextStore::open(config.context.max_turns)?;
+    let entries = store.load_file_io_log()?;
+    println!(
+        "{} File I/O log · {}",
+        ui::CONTEXT,
+        store.scope_description()
+    );
+    println!("{} Database · {}", ui::DATABASE, store.path_ref().display());
+    if entries.is_empty() {
+        println!("{} No file I/O logged yet.", ui::EMPTY);
+        return Ok(());
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let result = match &entry.event.outcome {
+            FileIoOutcome::Succeeded { .. } => "succeeded",
+            FileIoOutcome::Failed { .. } => "failed",
+        };
+        println!(
+            "\n─ {} · {} · {} · {result}",
+            index + 1,
+            entry.created_at,
+            entry.event.operation.as_str()
+        );
+        println!(
+            "{} You · {}",
+            ui::REQUEST,
+            terminal_safe_line(&entry.request)
+        );
+        println!(
+            "  Directory · {}",
+            terminal_safe_line(&entry.working_directory)
+        );
+        println!(
+            "  File · {}",
+            entry
+                .event
+                .path
+                .as_deref()
+                .map(terminal_safe_line)
+                .unwrap_or_else(|| "<unavailable>".into())
+        );
+        if let Some(offset) = entry.event.offset {
+            println!("  Offset · {offset}");
+        }
+        match &entry.event.outcome {
+            FileIoOutcome::Succeeded { content } => {
+                println!("  Content · {} bytes", content.len());
+                println!("{}", terminal_safe_content(content));
+            }
+            FileIoOutcome::Failed { reason } => {
+                println!("  Reason · {}", terminal_safe_line(reason));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn terminal_safe_content(content: &str) -> String {
+    terminal_safe_text(content, true)
+}
+
+fn terminal_safe_line(content: &str) -> String {
+    terminal_safe_text(content, false)
+}
+
+fn terminal_safe_text(content: &str, preserve_layout: bool) -> String {
+    let mut safe = String::with_capacity(content.len());
+    for character in content.chars() {
+        if !character.is_control() || (preserve_layout && (character == '\n' || character == '\t'))
+        {
+            safe.push(character);
+        } else {
+            safe.extend(character.escape_default());
+        }
+    }
+    safe
+}
+
 fn check_config() -> Result<()> {
     let config = Config::load()?;
     let client = AiClient::new(&config)?;
@@ -290,7 +397,9 @@ const DEFAULT_SHELL: Shell = Shell::Bash;
 
 #[cfg(test)]
 mod tests {
-    use super::{DestructiveRisk, warn_before_command_with};
+    use super::{
+        DestructiveRisk, terminal_safe_content, terminal_safe_line, warn_before_command_with,
+    };
 
     #[test]
     fn risk_messages_use_their_assigned_light_color_without_a_countdown() {
@@ -307,5 +416,14 @@ mod tests {
             assert!(warning.ends_with("\x1b[0m\n"));
             assert!(!warning.contains("Command available in"));
         }
+    }
+
+    #[test]
+    fn logged_content_cannot_emit_terminal_control_sequences() {
+        assert_eq!(
+            terminal_safe_content("first\n\x1b[31msecond\r\n"),
+            "first\n\\u{1b}[31msecond\\r\n"
+        );
+        assert_eq!(terminal_safe_line("denied\nreason"), "denied\\nreason");
     }
 }

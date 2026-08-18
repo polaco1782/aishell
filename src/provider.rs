@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::cli::Shell;
 use crate::config::Config;
 use crate::context::ContextTurn;
-use crate::file_tools::{READ_FILE_TOOL, WRITE_FILE_TOOL, WorkspaceFiles};
+use crate::file_tools::{FileIoEvent, READ_FILE_TOOL, WRITE_FILE_TOOL, WorkspaceFiles};
 use crate::system_info::SystemInfo;
 
 mod llama_cpp;
@@ -191,6 +191,7 @@ impl AiClient {
         history: &[ContextTurn],
         working_directory: &Path,
         system_info: &SystemInfo,
+        mut record_file_io: impl FnMut(&FileIoEvent) -> Result<(), String>,
     ) -> Result<GeneratedOutput, ProviderError> {
         let workspace = self
             .file_io
@@ -247,11 +248,12 @@ impl AiClient {
                     choice.message.tool_calls.clone(),
                 ));
                 for tool_call in choice.message.tool_calls {
-                    let result = workspace.execute(
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                    );
-                    messages.push(Message::tool(tool_call.id, result));
+                    let execution =
+                        workspace.execute(&tool_call.function.name, &tool_call.function.arguments);
+                    if let Some(audit) = execution.audit.as_ref() {
+                        record_file_io(audit).map_err(ProviderError::FileAudit)?;
+                    }
+                    messages.push(Message::tool(tool_call.id, execution.response));
                 }
                 continue;
             }
@@ -610,6 +612,8 @@ pub enum ProviderError {
     ModelUnavailable { provider: Provider, model: String },
     #[error("file tools are unavailable: {0}")]
     FileTools(String),
+    #[error("could not save the file I/O audit log: {0}")]
+    FileAudit(String),
     #[error("the model exceeded the limit of {MAX_FILE_TOOL_CALLS} file tool calls")]
     ToolLimitExceeded,
     #[error("the AI provider returned an invalid response: {0}")]
@@ -618,6 +622,7 @@ pub enum ProviderError {
     InvalidCommand(String),
 }
 
+#[cfg(test)]
 fn retry_invalid_responses<T>(
     mut attempt: impl FnMut(Option<&str>) -> Result<T, ProviderError>,
 ) -> Result<T, ProviderError> {
@@ -759,6 +764,7 @@ fn verify_model_available(
     })
 }
 
+#[cfg(test)]
 fn parse_chat_response(body: &str) -> Result<GeneratedOutput, ProviderError> {
     let choice = parse_chat_choice(body)?;
     if !choice.message.tool_calls.is_empty() {
@@ -931,13 +937,15 @@ mod tests {
         serde_json::to_value(ChatRequest::new(
             provider,
             model,
-            vec![Message {
-                role: "user",
-                content: "test".into(),
-            }],
+            vec![Message::user("test".into())],
             256,
+            false,
         ))
         .unwrap()
+    }
+
+    fn content(message: &Message) -> &str {
+        message.content.as_deref().unwrap()
     }
 
     #[test]
@@ -996,44 +1004,47 @@ mod tests {
             "/tmp/images",
             &system_info,
             "create a filesystem on it",
+            false,
         );
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, "user");
-        assert!(messages[1].content.contains("create a 50 meg file"));
+        assert!(content(&messages[1]).contains("create a 50 meg file"));
         assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "COMMAND: truncate -s 50M disk.img");
-        assert!(messages[3].content.contains("create a filesystem on it"));
-        assert!(messages[3].content.contains(&system_info.model_context()));
-        assert!(
-            messages[0]
-                .content
-                .contains("may have been changed or never executed")
-        );
-        assert!(messages[0].content.contains("ANSWER:"));
-        assert!(messages[0].content.contains("RISK:"));
-        assert!(messages[0].content.contains("what can you do?"));
-        assert!(messages[0].content.contains("distribution family"));
+        assert_eq!(content(&messages[2]), "COMMAND: truncate -s 50M disk.img");
+        assert!(content(&messages[3]).contains("create a filesystem on it"));
+        assert!(content(&messages[3]).contains(&system_info.model_context()));
+        assert!(content(&messages[0]).contains("may have been changed or never executed"));
+        assert!(content(&messages[0]).contains("ANSWER:"));
+        assert!(content(&messages[0]).contains("RISK:"));
+        assert!(content(&messages[0]).contains("what can you do?"));
+        assert!(content(&messages[0]).contains("distribution family"));
     }
 
     #[test]
     fn gives_windows_shells_distinct_syntax_contracts() {
         let system_info = SystemInfo::detect();
-        let powershell = chat_messages(Shell::Pwsh, &[], "C:\\work", &system_info, "show files");
-        assert!(
-            powershell[0]
-                .content
-                .contains("executable powershell command line")
+        let powershell = chat_messages(
+            Shell::Pwsh,
+            &[],
+            "C:\\work",
+            &system_info,
+            "show files",
+            false,
         );
-        assert!(
-            powershell[0]
-                .content
-                .contains("Windows PowerShell 5.1 and PowerShell 7")
-        );
+        assert!(content(&powershell[0]).contains("executable powershell command line"));
+        assert!(content(&powershell[0]).contains("Windows PowerShell 5.1 and PowerShell 7"));
 
-        let cmd = chat_messages(Shell::Cmd, &[], "C:\\work", &system_info, "show files");
-        assert!(cmd[0].content.contains("executable cmd command line"));
-        assert!(cmd[0].content.contains("Use cmd.exe built-ins"));
+        let cmd = chat_messages(
+            Shell::Cmd,
+            &[],
+            "C:\\work",
+            &system_info,
+            "show files",
+            false,
+        );
+        assert!(content(&cmd[0]).contains("executable cmd command line"));
+        assert!(content(&cmd[0]).contains("Use cmd.exe built-ins"));
     }
 
     #[test]

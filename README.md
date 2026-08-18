@@ -134,12 +134,19 @@ max_output_tokens = 256
 enabled = true
 max_turns = 6
 
+[tools]
+file_io = false
+
 [safety]
 risk_warning = true
 ```
 
 The `[safety]` setting controls whether the color-coded message described in
 [Command risk](#command-risk) is displayed. It defaults to `true`.
+Setting `tools.file_io = true` lets the model read and atomically create or
+replace UTF-8 text files below the current working directory. Reads and writes
+are bounded, and paths cannot escape through absolute paths, parent traversal,
+or symbolic links.
 
 Useful configuration commands:
 
@@ -150,6 +157,7 @@ ai config check    # checks authentication, endpoint, and configured model
 ai context path    # prints the central history database path
 ai context show    # shows the current bounded context
 ai context clear   # forgets the current context
+ai logs            # shows model file reads, writes, and modifications
 ```
 
 Provider defaults used by `ai setup`:
@@ -368,6 +376,16 @@ Saved commands are explicitly treated as unconfirmed: `aishell` knows what it
 inserted for review, but cannot assume the user executed it unchanged. Set
 `context.enabled = false` to disable history, reduce `context.max_turns` to send
 less history, or use `ai context clear` to erase the current context.
+
+Every model file-tool call is appended immediately to the same private database
+with the request, attempted operation, path when available, and byte offset for
+reads. Successful reads, new-file writes, and existing-file modifications also
+record the exact content involved; failed calls record why the read or write was
+denied. This audit logging remains active whenever `tools.file_io = true`, even
+when conversational context is disabled. Use `ai logs` to read the audit trail
+for the current shell session/worktree scope. `ai context clear` also erases that
+scope's file I/O log. Logged text is escaped when necessary so terminal control
+bytes cannot be replayed by the log viewer.
 
 Each request includes the host OS family and architecture. On Linux, `aishell`
 also reads the standard public `/etc/os-release` file, falling back to

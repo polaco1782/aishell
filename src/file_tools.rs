@@ -16,6 +16,51 @@ const MAX_READ_BYTES: usize = 32 * 1024;
 const MAX_WRITE_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileIoOperation {
+    Read,
+    Write,
+    Modify,
+}
+
+impl FileIoOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Modify => "modify",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            "modify" => Ok(Self::Modify),
+            _ => bail!("file I/O log contains an unknown operation {value:?}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileIoEvent {
+    pub operation: FileIoOperation,
+    pub path: Option<String>,
+    pub offset: Option<u64>,
+    pub outcome: FileIoOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileIoOutcome {
+    Succeeded { content: String },
+    Failed { reason: String },
+}
+
+pub struct FileToolExecution {
+    pub response: String,
+    pub audit: Option<FileIoEvent>,
+}
+
 pub struct WorkspaceFiles {
     root: PathBuf,
 }
@@ -37,28 +82,37 @@ impl WorkspaceFiles {
         Ok(Self { root })
     }
 
-    pub fn execute(&self, name: &str, arguments: &str) -> String {
-        let result = match name {
-            READ_FILE_TOOL => self.read(arguments),
-            WRITE_FILE_TOOL => self.write(arguments),
-            _ => Err(anyhow::anyhow!("unknown file tool {name:?}")),
+    pub fn execute(&self, name: &str, arguments: &str) -> FileToolExecution {
+        let (operation, result) = match name {
+            READ_FILE_TOOL => (Some(FileIoOperation::Read), self.read(arguments)),
+            WRITE_FILE_TOOL => (Some(FileIoOperation::Write), self.write(arguments)),
+            _ => (None, Err(anyhow::anyhow!("unknown file tool {name:?}"))),
         };
 
         match result {
-            Ok(result) => result.to_string(),
-            Err(error) => json!({"ok": false, "error": format!("{error:#}")}).to_string(),
+            Ok((response, audit)) => FileToolExecution {
+                response: response.to_string(),
+                audit: Some(audit),
+            },
+            Err(error) => {
+                let reason = format!("{error:#}");
+                FileToolExecution {
+                    response: json!({"ok": false, "error": reason}).to_string(),
+                    audit: operation.map(|operation| failed_event(operation, arguments, reason)),
+                }
+            }
         }
     }
 
-    fn read(&self, arguments: &str) -> Result<Value> {
+    fn read(&self, arguments: &str) -> Result<(Value, FileIoEvent)> {
         let arguments: ReadFileArguments = parse_arguments(arguments, READ_FILE_TOOL)?;
         if arguments.max_bytes == 0 || arguments.max_bytes > MAX_READ_BYTES {
             bail!("max_bytes must be between 1 and {MAX_READ_BYTES}");
         }
 
         let (relative, path) = self.existing_file(&arguments.path, true)?;
-        let mut file = File::open(&path)
-            .with_context(|| format!("could not open {}", relative.display()))?;
+        let mut file =
+            File::open(&path).with_context(|| format!("could not open {}", relative.display()))?;
         let metadata = file
             .metadata()
             .with_context(|| format!("could not inspect {}", relative.display()))?;
@@ -83,17 +137,28 @@ impl WorkspaceFiles {
         let content = utf8_prefix(&bytes)?;
         let next_offset = arguments.offset + content.len() as u64;
 
-        Ok(json!({
-            "ok": true,
-            "path": relative.to_string_lossy(),
-            "offset": arguments.offset,
-            "next_offset": next_offset,
-            "eof": next_offset == metadata.len(),
-            "content": content,
-        }))
+        let path = relative.to_string_lossy().into_owned();
+        Ok((
+            json!({
+                "ok": true,
+                "path": path,
+                "offset": arguments.offset,
+                "next_offset": next_offset,
+                "eof": next_offset == metadata.len(),
+                "content": content,
+            }),
+            FileIoEvent {
+                operation: FileIoOperation::Read,
+                path: Some(path),
+                offset: Some(arguments.offset),
+                outcome: FileIoOutcome::Succeeded {
+                    content: content.to_owned(),
+                },
+            },
+        ))
     }
 
-    fn write(&self, arguments: &str) -> Result<Value> {
+    fn write(&self, arguments: &str) -> Result<(Value, FileIoEvent)> {
         let arguments: WriteFileArguments = parse_arguments(arguments, WRITE_FILE_TOOL)?;
         if arguments.content.len() > MAX_WRITE_BYTES {
             bail!("content exceeds the {MAX_WRITE_BYTES} byte write limit");
@@ -103,10 +168,13 @@ impl WorkspaceFiles {
         let requested = self.root.join(&relative);
         reject_symlink_components(&self.root, &relative, true)?;
 
-        let (target, permissions) = match fs::symlink_metadata(&requested) {
+        let (target, permissions, operation) = match fs::symlink_metadata(&requested) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    bail!("refusing to write through the symbolic link {}", relative.display());
+                    bail!(
+                        "refusing to write through the symbolic link {}",
+                        relative.display()
+                    );
                 }
                 let target = requested
                     .canonicalize()
@@ -115,7 +183,11 @@ impl WorkspaceFiles {
                 if !metadata.is_file() {
                     bail!("{} is not a regular file", relative.display());
                 }
-                (target, Some(metadata.permissions()))
+                (
+                    target,
+                    Some(metadata.permissions()),
+                    FileIoOperation::Modify,
+                )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let parent = requested
@@ -129,7 +201,7 @@ impl WorkspaceFiles {
                 let file_name = requested
                     .file_name()
                     .context("the file path has no file name")?;
-                (parent.join(file_name), None)
+                (parent.join(file_name), None, FileIoOperation::Write)
             }
             Err(error) => {
                 return Err(error)
@@ -143,11 +215,22 @@ impl WorkspaceFiles {
             "workspace file",
             permissions,
         )?;
-        Ok(json!({
-            "ok": true,
-            "path": relative.to_string_lossy(),
-            "bytes_written": arguments.content.len(),
-        }))
+        let path = relative.to_string_lossy().into_owned();
+        Ok((
+            json!({
+                "ok": true,
+                "path": path,
+                "bytes_written": arguments.content.len(),
+            }),
+            FileIoEvent {
+                operation,
+                path: Some(path),
+                offset: None,
+                outcome: FileIoOutcome::Succeeded {
+                    content: arguments.content,
+                },
+            },
+        ))
     }
 
     fn existing_file(&self, input: &str, follow_final_link: bool) -> Result<(PathBuf, PathBuf)> {
@@ -192,6 +275,31 @@ struct WriteFileArguments {
 
 fn parse_arguments<'a, T: Deserialize<'a>>(arguments: &'a str, tool: &str) -> Result<T> {
     serde_json::from_str(arguments).with_context(|| format!("invalid {tool} arguments"))
+}
+
+fn failed_event(operation: FileIoOperation, arguments: &str, reason: String) -> FileIoEvent {
+    let arguments = serde_json::from_str::<Value>(arguments).ok();
+    let path = arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| path.len() <= MAX_PATH_BYTES)
+        .map(str::to_owned);
+    let offset = if operation == FileIoOperation::Read {
+        arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("offset"))
+            .and_then(Value::as_u64)
+    } else {
+        None
+    };
+
+    FileIoEvent {
+        operation,
+        path,
+        offset,
+        outcome: FileIoOutcome::Failed { reason },
+    }
 }
 
 fn validate_relative_path(input: &str) -> Result<PathBuf> {
@@ -267,10 +375,10 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::WorkspaceFiles;
+    use super::{FileIoOperation, FileIoOutcome, FileToolExecution, WorkspaceFiles};
 
-    fn result(output: String) -> Value {
-        serde_json::from_str(&output).unwrap()
+    fn result(execution: &FileToolExecution) -> Value {
+        serde_json::from_str(&execution.response).unwrap()
     }
 
     #[test]
@@ -279,21 +387,25 @@ mod tests {
         fs::write(directory.path().join("script.sh"), "echo café\necho done\n").unwrap();
         let tools = WorkspaceFiles::new(directory.path()).unwrap();
 
-        let first = result(tools.execute(
-            "read_file",
-            r#"{"path":"script.sh","max_bytes":9}"#,
-        ));
+        let first_execution = tools.execute("read_file", r#"{"path":"script.sh","max_bytes":9}"#);
+        let first = result(&first_execution);
         assert_eq!(first["ok"], true);
         assert_eq!(first["content"], "echo caf");
         assert_eq!(first["next_offset"], 8);
         assert_eq!(first["eof"], false);
+        assert_eq!(
+            first_execution.audit.unwrap().operation,
+            FileIoOperation::Read
+        );
 
-        let second = result(tools.execute(
+        let second_execution = tools.execute(
             "read_file",
             r#"{"path":"script.sh","offset":8,"max_bytes":32}"#,
-        ));
+        );
+        let second = result(&second_execution);
         assert_eq!(second["content"], "é\necho done\n");
         assert_eq!(second["eof"], true);
+        assert_eq!(second_execution.audit.unwrap().offset, Some(8));
     }
 
     #[test]
@@ -308,17 +420,30 @@ mod tests {
         }
         let tools = WorkspaceFiles::new(directory.path()).unwrap();
 
-        let written = result(tools.execute(
+        let execution = tools.execute(
             "write_file",
-            r#"{"path":"script.sh","content":"\#!/bin/sh\necho new\n"}"#,
-        ));
+            r##"{"path":"script.sh","content":"#!/bin/sh\necho new\n"}"##,
+        );
+        let written = result(&execution);
         assert_eq!(written["ok"], true);
         assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho new\n");
+        let audit = execution.audit.unwrap();
+        assert_eq!(audit.operation, FileIoOperation::Modify);
+        assert_eq!(audit.path.as_deref(), Some("script.sh"));
+        assert_eq!(
+            audit.outcome,
+            FileIoOutcome::Succeeded {
+                content: "#!/bin/sh\necho new\n".into()
+            }
+        );
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
     }
 
@@ -328,24 +453,24 @@ mod tests {
         fs::create_dir(directory.path().join("scripts")).unwrap();
         let tools = WorkspaceFiles::new(directory.path()).unwrap();
 
-        assert_eq!(
-            result(tools.execute(
-                "write_file",
-                r#"{"path":"scripts/new.sh","content":"echo hello\n"}"#,
-            ))["ok"],
-            true
+        let creation = tools.execute(
+            "write_file",
+            r#"{"path":"scripts/new.sh","content":"echo hello\n"}"#,
         );
+        assert_eq!(result(&creation)["ok"], true);
+        assert_eq!(creation.audit.unwrap().operation, FileIoOperation::Write);
         assert_eq!(
             fs::read_to_string(directory.path().join("scripts/new.sh")).unwrap(),
             "echo hello\n"
         );
-        assert_eq!(
-            result(tools.execute(
-                "write_file",
-                r#"{"path":"missing/new.sh","content":"nope"}"#,
-            ))["ok"],
-            false
+        let denied = tools.execute(
+            "write_file",
+            r#"{"path":"missing/new.sh","content":"nope"}"#,
         );
+        assert_eq!(result(&denied)["ok"], false);
+        let audit = denied.audit.unwrap();
+        assert_eq!(audit.path.as_deref(), Some("missing/new.sh"));
+        assert!(matches!(audit.outcome, FileIoOutcome::Failed { .. }));
     }
 
     #[test]
@@ -357,8 +482,31 @@ mod tests {
             r#"{"path":"../outside","content":"nope"}"#,
             r#"{"path":"/tmp/outside","content":"nope"}"#,
         ] {
-            assert_eq!(result(tools.execute("write_file", arguments))["ok"], false);
+            let execution = tools.execute("write_file", arguments);
+            assert_eq!(result(&execution)["ok"], false);
+            let audit = execution.audit.unwrap();
+            assert_eq!(audit.operation, FileIoOperation::Write);
+            let FileIoOutcome::Failed { reason } = audit.outcome else {
+                panic!("denied write was logged as successful");
+            };
+            assert!(reason.contains("path must be relative") || reason.contains("parent"));
         }
+    }
+
+    #[test]
+    fn logs_malformed_read_failures_without_inventing_a_path() {
+        let directory = tempdir().unwrap();
+        let tools = WorkspaceFiles::new(directory.path()).unwrap();
+
+        let execution = tools.execute("read_file", r#"{"path":42}"#);
+        assert_eq!(result(&execution)["ok"], false);
+        let audit = execution.audit.unwrap();
+        assert_eq!(audit.operation, FileIoOperation::Read);
+        assert_eq!(audit.path, None);
+        let FileIoOutcome::Failed { reason } = audit.outcome else {
+            panic!("malformed read was logged as successful");
+        };
+        assert!(reason.contains("invalid read_file arguments"));
     }
 
     #[cfg(unix)]
@@ -373,14 +521,11 @@ mod tests {
         let tools = WorkspaceFiles::new(directory.path()).unwrap();
 
         assert_eq!(
-            result(tools.execute("read_file", r#"{"path":"outside/secret"}"#))["ok"],
+            result(&tools.execute("read_file", r#"{"path":"outside/secret"}"#))["ok"],
             false
         );
         assert_eq!(
-            result(tools.execute(
-                "write_file",
-                r#"{"path":"outside/new","content":"nope"}"#,
-            ))["ok"],
+            result(&tools.execute("write_file", r#"{"path":"outside/new","content":"nope"}"#,))["ok"],
             false
         );
     }

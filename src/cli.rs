@@ -73,6 +73,7 @@ pub enum Action {
     ContextPath,
     ContextShow,
     ContextClear,
+    Logs,
     Init(Shell),
     Help,
     Version,
@@ -94,6 +95,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Action> {
             return Ok(Action::Version);
         }
         [command] if command == "setup" => return Ok(Action::Setup),
+        [command] if command == "logs" => return Ok(Action::Logs),
         [command, shell] if command == "init" => {
             return Ok(Action::Init(Shell::parse_integration(shell)?));
         }
@@ -155,6 +157,7 @@ Usage:
   ai setup
   ai config path|show|check
   ai context path|show|clear
+  ai logs
   ai init bash|zsh|powershell
 
 Shell integration:
@@ -190,7 +193,8 @@ classification or validation.
 
 The integration keeps a bounded command-generation context in one private state
 database. Use `ai context show` to inspect the current context or `clear` to
-forget it.
+forget it. When file tools are enabled, `ai logs` shows every file tool call,
+including the exact content of successful operations and why failures were denied.
 "#;
 
 #[cfg(test)]
@@ -301,5 +305,6 @@ mod tests {
             parse(args(&["context", "clear"])).unwrap(),
             Action::ContextClear
         );
+        assert_eq!(parse(args(&["logs"])).unwrap(), Action::Logs);
     }
 }
