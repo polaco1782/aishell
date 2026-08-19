@@ -246,7 +246,7 @@ impl WorkspaceFiles {
     }
 
     fn require_within_root(&self, path: &Path, relative: &Path) -> Result<()> {
-        if !path.starts_with(&self.root) || path == self.root {
+        if !path.starts_with(&self.root) {
             bail!(
                 "{} resolves outside the current working directory",
                 relative.display()
@@ -448,10 +448,20 @@ mod tests {
     }
 
     #[test]
-    fn creates_files_only_below_an_existing_workspace_directory() {
+    fn creates_files_at_the_workspace_root_and_in_existing_subdirectories() {
         let directory = tempdir().unwrap();
         fs::create_dir(directory.path().join("scripts")).unwrap();
         let tools = WorkspaceFiles::new(directory.path()).unwrap();
+
+        let root_creation = tools.execute(
+            "write_file",
+            r##"{"path":"run.sh","content":"#!/bin/sh\n"}"##,
+        );
+        assert_eq!(result(&root_creation)["ok"], true);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("run.sh")).unwrap(),
+            "#!/bin/sh\n"
+        );
 
         let creation = tools.execute(
             "write_file",
