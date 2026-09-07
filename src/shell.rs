@@ -417,6 +417,24 @@ function global:Invoke-AishellUtf8Console {
     }
 }
 
+# PSReadLine 2.0 on Windows PowerShell changes the native console code page,
+# but .NET can retain an OEM-encoded Console.Out writer. A per-key guard only
+# fixes the Tab redraw: SelfInsert then replaces the emoji with question marks.
+# Keep both encodings aligned for the entire edit, restoring the user's encoding
+# before the accepted command runs. Save the original reader only once on reload.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    if (-not (Get-Variable __AishellOriginalReadLine -Scope Global -ErrorAction SilentlyContinue)) {
+        $global:__AishellOriginalReadLine = (Get-Command PSConsoleHostReadLine -CommandType Function).ScriptBlock
+    }
+    # Import-Module can re-export the original reader even when already loaded.
+    # Reinstall our wrapper on each init without wrapping a previous wrapper.
+    function global:PSConsoleHostReadLine {
+        Invoke-AishellUtf8Console {
+            & $global:__AishellOriginalReadLine
+        }
+    }
+}
+
 function global:Set-AishellBuffer {
     param([string]$Text = '')
 
@@ -434,17 +452,6 @@ function global:Write-AishellErrorLine {
     Invoke-AishellUtf8Console {
         [Console]::Error.WriteLine($Message)
     }
-}
-
-function global:Write-AishellDiagnostics {
-    param([string]$Message)
-
-    if ([string]::IsNullOrWhiteSpace($Message)) {
-        return
-    }
-    Write-AishellErrorLine
-    Write-AishellErrorLine ($Message.TrimEnd([char[]]@("`r", "`n")))
-    [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
 }
 
 function global:Invoke-AishellGeneration {
@@ -551,14 +558,7 @@ function global:Invoke-AishellGeneration {
         }
     }
 
-    [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
-    if ($generationStatus -eq 0) {
-        if (-not [string]::IsNullOrEmpty($generated)) {
-            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($generated)
-        }
-    }
-    else {
-        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($Line)
+    if ($generationStatus -ne 0) {
         if ($diagnosticsVisible) {
             $diagnostics = $global:__AishellError + ' Generation failed; request kept for editing'
         }
@@ -570,7 +570,34 @@ function global:Invoke-AishellGeneration {
             $diagnostics = $global:__AishellError + ' Generation failed; request kept for editing'
         }
     }
-    Write-AishellDiagnostics $diagnostics
+    if (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
+        if (-not $diagnosticsVisible) {
+            Set-AishellBuffer
+            Write-AishellErrorLine
+        }
+        Write-AishellErrorLine ($diagnostics.TrimEnd([char[]]@("`r", "`n")))
+        $diagnosticsVisible = $true
+    }
+    # Direct console output moves the cursor without updating PSReadLine's
+    # render origin. Resynchronize before touching the buffer, including on
+    # success, or the next edit overwrites diagnostics and loses the prompt.
+    if ($diagnosticsVisible) {
+        Invoke-AishellUtf8Console {
+            [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt($null, [Console]::CursorTop)
+        }
+    }
+    Invoke-AishellUtf8Console {
+        # Discard spinner edits so Undo cannot bring status text back as input.
+        [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        if ($generationStatus -eq 0) {
+            if (-not [string]::IsNullOrEmpty($generated)) {
+                [Microsoft.PowerShell.PSConsoleReadLine]::Insert($generated)
+            }
+        }
+        else {
+            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($Line)
+        }
+    }
 }
 
 $global:__AishellTabHandler = {
@@ -586,6 +613,9 @@ $global:__AishellTabHandler = {
     if ($line.Length -ne 0) {
         if ((Get-PSReadLineOption).EditMode -eq 'Vi') {
             [Microsoft.PowerShell.PSConsoleReadLine]::ViTabCompleteNext()
+        }
+        elseif ((Get-PSReadLineOption).EditMode -eq 'Emacs') {
+            [Microsoft.PowerShell.PSConsoleReadLine]::Complete()
         }
         else {
             [Microsoft.PowerShell.PSConsoleReadLine]::TabCompleteNext()
@@ -716,6 +746,7 @@ mod tests {
         assert!(script.contains("$process.StandardError.ReadLineAsync()"));
         assert!(script.contains("Write-AishellErrorLine $diagnosticLine"));
         assert!(script.contains("::Insert($generated)"));
+        assert!(script.contains("::Complete()"));
         assert!(script.contains("[Console]::OutputEncoding = $global:__AishellUtf8Encoding"));
         assert!(script.contains("[Console]::OutputEncoding = $previousEncoding"));
         assert!(script.contains("function global:Write-AishellErrorLine"));

@@ -88,6 +88,14 @@ jobs:
       - name: Build optimized binary
         run: cargo build --release --locked
 
+      - name: Test Windows PowerShell Tab integration
+        shell: powershell
+        run: ./tests/powershell-tab.ps1 -Binary target/release/ai.exe -FixtureDirectory target/tab-tests
+
+      - name: Test PowerShell 7 Tab integration
+        shell: pwsh
+        run: ./tests/powershell-tab.ps1 -Binary target/release/ai.exe -FixtureDirectory target/tab-tests
+
       - name: Validate Windows shell contracts
         shell: pwsh
         run: |

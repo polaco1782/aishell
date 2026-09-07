@@ -327,7 +327,9 @@ taking over commands or paths the user is already typing.
 
 The integration binds Tab in the Bash and Zsh Emacs and vi-insert keymaps.
 PowerShell binds the current PSReadLine mode, including only Insert mode when Vi
-editing is active. Bash and PowerShell also wrap Enter so they can submit an
+editing is active. Completion uses the mode's default behavior: cycling in
+Windows and Vi modes, or common-prefix/list completion in Emacs mode.
+Bash and PowerShell also wrap Enter so they can submit an
 active AI prompt while retaining normal accept-line behavior everywhere else.
 A shell setup that assigns custom Tab or Enter behavior should load the `ai`
 integration after its completion framework.
