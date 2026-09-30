@@ -491,10 +491,26 @@ function global:Invoke-AishellGeneration {
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
-        if (-not $process.Start()) {
+        # .NET Framework creates an auto-flushing stdin writer using
+        # Console.InputEncoding. A BOM-bearing encoding writes its preamble
+        # during Start(), before our raw UTF-8 bytes reach the pipe.
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $previousInputEncoding = [Console]::InputEncoding
+            try {
+                [Console]::InputEncoding = $utf8
+                $started = $process.Start()
+            }
+            finally {
+                [Console]::InputEncoding = $previousInputEncoding
+            }
+        }
+        else {
+            $startInfo.StandardInputEncoding = $utf8
+            $started = $process.Start()
+        }
+        if (-not $started) {
             throw 'could not start ai.exe'
         }
-        $started = $true
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrLineTask = $process.StandardError.ReadLineAsync()
         $requestBytes = $utf8.GetBytes($request)

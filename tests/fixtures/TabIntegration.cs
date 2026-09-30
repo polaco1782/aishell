@@ -68,4 +68,11 @@ public static class TabTestEditor
 public static class TabTestConsole
 {
     public static Encoding OutputEncoding = Encoding.GetEncoding(850);
+    // Process.Start on .NET Framework reads the real console input encoding
+    // when it constructs the child's stdin writer; keep that path observable.
+    public static Encoding InputEncoding
+    {
+        get { return Console.InputEncoding; }
+        set { Console.InputEncoding = value; }
+    }
 }

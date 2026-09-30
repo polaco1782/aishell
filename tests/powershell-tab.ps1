@@ -44,6 +44,14 @@ function Set-PSReadLineKeyHandler {
     $script:handlers[$Chord] = $ScriptBlock
 }
 function Assert-Equal($Actual, $Expected, [string]$Label) {
+    if ($Actual -is [string] -and $Expected -is [string]) {
+        # PowerShell's culture-sensitive comparison ignores characters such
+        # as U+FEFF, hiding a BOM until the cursor-length assertion fails.
+        if (-not [string]::Equals($Actual, $Expected, [StringComparison]::Ordinal)) {
+            throw "${Label}: expected [$Expected] (length $($Expected.Length)), got [$Actual] (length $($Actual.Length))"
+        }
+        return
+    }
     if ($Actual -cne $Expected) { throw "${Label}: expected [$Expected], got [$Actual]" }
 }
 function Reset-Editor([string]$Text = '') {
@@ -71,73 +79,82 @@ function global:PSConsoleHostReadLine {
 $script:originalHostReader = (Get-Command PSConsoleHostReadLine).ScriptBlock
 
 $previousPath = $env:PATH
+$previousInputEncoding = [Console]::InputEncoding
 try {
     $env:PATH = $FixtureDirectory + ';' + $env:PATH
-    foreach ($script:mode in @('Windows', 'Emacs', 'Vi')) {
-        # Import-Module re-exports PSConsoleHostReadLine when init is reloaded.
-        Set-Item Function:\global:PSConsoleHostReadLine -Value $script:originalHostReader
-        Invoke-Expression $init
-        # Keep stdout/stderr cursor ownership observable without a real terminal.
-        function global:Write-AishellErrorLine {
-            param([AllowEmptyString()][string]$Message = '')
-            [TabTestEditor]::OutputSincePrompt = $true
-            $script:diagnostics += $Message
-        }
-
-        if ($PSVersionTable.PSEdition -eq 'Desktop') {
-            Reset-Editor
-            $script:readerCalls = 0
-            $script:readerThrows = $false
-            $result = PSConsoleHostReadLine
-            Assert-Equal $result ($global:__AishellPromptPrefix + 'a') 'Reader returns editable input'
-            Assert-Equal $script:readerCalls 1 'Reload calls the original reader once'
-            Assert-Equal ([TabTestConsole]::OutputEncoding.CodePage) 850 'Encoding restored before command execution'
-            $script:readerThrows = $true
-            $interrupted = $false
-            try { PSConsoleHostReadLine } catch { $interrupted = $true }
-            Assert-Equal $interrupted $true 'Reader exception propagates'
-            Assert-Equal ([TabTestConsole]::OutputEncoding.CodePage) 850 'Encoding restored after interruption'
-            $script:readerThrows = $false
-        }
-
-        Reset-Editor
-        & $script:handlers.Tab
-        Assert-Equal ([TabTestEditor]::Buffer) $global:__AishellPromptPrefix 'Empty Tab opens AI'
-        & $script:handlers.Tab
-        & $script:handlers.Enter
-        Assert-Equal ([TabTestEditor]::Accepted) 0 'Empty request is never executed'
-        Assert-Equal ([TabTestEditor]::Buffer) $global:__AishellPromptPrefix 'Empty request stays editable'
-
-        foreach ($request in @('command', 'quiet', 'answer', 'failure', ('a' + [char]0x00E7 + [char]0x00E3 + 'o'))) {
-            foreach ($key in @('Tab', 'Enter')) {
-                $line = $global:__AishellPromptPrefix + $request
-                Reset-Editor $line
-                & $script:handlers[$key]
-                $expected = "Write-Output '$request'"
-                if ($request -eq 'failure') { $expected = $line }
-                if ($request -eq 'answer') { $expected = '' }
-                Assert-Equal ([TabTestEditor]::Buffer) $expected "$key $request result"
-                Assert-Equal ([TabTestEditor]::Cursor) $expected.Length "$key $request cursor"
-                Assert-Equal ([TabTestEditor]::Accepted) 0 "$key must leave result unexecuted"
-                Assert-Equal ([TabTestEditor]::OutputSincePrompt) $false 'Diagnostics are synchronized'
-                if ($request -ne 'quiet' -and [TabTestEditor]::Redraws -eq 0) {
-                    throw 'Diagnostics require a prompt redraw'
-                }
-                # The next keystroke must edit the command/request normally.
-                [TabTestEditor]::Insert('x')
-                Assert-Equal ([TabTestEditor]::Buffer) ($expected + 'x') 'Editing after generation'
+    # Exercise both an OEM console and the BOM-bearing UTF-8 encoding that
+    # .NET Framework uses on CI. The stdin transport must preserve exact text.
+    foreach ($inputEncoding in @([Text.Encoding]::GetEncoding(850), [Text.Encoding]::UTF8)) {
+        [Console]::InputEncoding = $inputEncoding
+        foreach ($script:mode in @('Windows', 'Emacs', 'Vi')) {
+            # Import-Module re-exports PSConsoleHostReadLine when init is reloaded.
+            Set-Item Function:\global:PSConsoleHostReadLine -Value $script:originalHostReader
+            Invoke-Expression $init
+            # Keep stdout/stderr cursor ownership observable without a real terminal.
+            function global:Write-AishellErrorLine {
+                param([AllowEmptyString()][string]$Message = '')
+                [TabTestEditor]::OutputSincePrompt = $true
+                $script:diagnostics += $Message
             }
-        }
 
-        Reset-Editor 'Get-Ch'
-        & $script:handlers.Tab
-        & $script:handlers.Tab
-        Assert-Equal ([TabTestEditor]::Completion) $script:mode 'Normal completion respects edit mode'
-        & $script:handlers.Enter
-        Assert-Equal ([TabTestEditor]::Accepted) 1 'Normal Enter still accepts input'
+            if ($PSVersionTable.PSEdition -eq 'Desktop') {
+                Reset-Editor
+                $script:readerCalls = 0
+                $script:readerThrows = $false
+                $result = PSConsoleHostReadLine
+                Assert-Equal $result ($global:__AishellPromptPrefix + 'a') 'Reader returns editable input'
+                Assert-Equal $script:readerCalls 1 'Reload calls the original reader once'
+                Assert-Equal ([TabTestConsole]::OutputEncoding.CodePage) 850 'Encoding restored before command execution'
+                $script:readerThrows = $true
+                $interrupted = $false
+                try { PSConsoleHostReadLine } catch { $interrupted = $true }
+                Assert-Equal $interrupted $true 'Reader exception propagates'
+                Assert-Equal ([TabTestConsole]::OutputEncoding.CodePage) 850 'Encoding restored after interruption'
+                $script:readerThrows = $false
+            }
+
+            Reset-Editor
+            & $script:handlers.Tab
+            Assert-Equal ([TabTestEditor]::Buffer) $global:__AishellPromptPrefix 'Empty Tab opens AI'
+            & $script:handlers.Tab
+            & $script:handlers.Enter
+            Assert-Equal ([TabTestEditor]::Accepted) 0 'Empty request is never executed'
+            Assert-Equal ([TabTestEditor]::Buffer) $global:__AishellPromptPrefix 'Empty request stays editable'
+
+            foreach ($request in @('command', 'quiet', 'answer', 'failure', ('a' + [char]0x00E7 + [char]0x00E3 + 'o'))) {
+                foreach ($key in @('Tab', 'Enter')) {
+                    $line = $global:__AishellPromptPrefix + $request
+                    Reset-Editor $line
+                    & $script:handlers[$key]
+                    Assert-Equal ([Console]::InputEncoding.CodePage) $inputEncoding.CodePage 'Input encoding restored after generation'
+                    Assert-Equal ([Console]::InputEncoding.GetPreamble().Length) $inputEncoding.GetPreamble().Length 'Input preamble restored after generation'
+                    $expected = "Write-Output '$request'"
+                    if ($request -eq 'failure') { $expected = $line }
+                    if ($request -eq 'answer') { $expected = '' }
+                    Assert-Equal ([TabTestEditor]::Buffer) $expected "$key $request result"
+                    Assert-Equal ([TabTestEditor]::Cursor) $expected.Length "$key $request cursor"
+                    Assert-Equal ([TabTestEditor]::Accepted) 0 "$key must leave result unexecuted"
+                    Assert-Equal ([TabTestEditor]::OutputSincePrompt) $false 'Diagnostics are synchronized'
+                    if ($request -ne 'quiet' -and [TabTestEditor]::Redraws -eq 0) {
+                        throw 'Diagnostics require a prompt redraw'
+                    }
+                    # The next keystroke must edit the command/request normally.
+                    [TabTestEditor]::Insert('x')
+                    Assert-Equal ([TabTestEditor]::Buffer) ($expected + 'x') 'Editing after generation'
+                }
+            }
+
+            Reset-Editor 'Get-Ch'
+            & $script:handlers.Tab
+            & $script:handlers.Tab
+            Assert-Equal ([TabTestEditor]::Completion) $script:mode 'Normal completion respects edit mode'
+            & $script:handlers.Enter
+            Assert-Equal ([TabTestEditor]::Accepted) 1 'Normal Enter still accepts input'
+        }
     }
     Write-Output "PowerShell $($PSVersionTable.PSVersion): Tab integration regression checks passed"
 }
 finally {
     $env:PATH = $previousPath
+    [Console]::InputEncoding = $previousInputEncoding
 }
